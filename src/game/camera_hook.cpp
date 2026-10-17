@@ -35,9 +35,7 @@ constexpr uintptr_t k_fov = 0x274;
 constexpr uintptr_t k_projection_dirty = 0x284;
 
 // Main camera state across frames (game thread).
-bool g_overriding = false;         // CameraData currently holds our fov/aspect
-float g_game_fov = 0, g_game_aspect = 0;
-float g_written_fov = 0, g_written_aspect = 0;
+bool g_projection_is_ours = false; // CameraData+0x40 holds the headset projection
 math::Mat4 g_last_view_projection{};
 bool g_have_last = false;
 float g_last_yaw_forward[2] = {0.0f, -1.0f}; // fallback when the camera looks straight up/down
@@ -59,21 +57,6 @@ Vec4 with_w(const math::Vec3& v, float w) {
     return {v.x, v.y, v.z, w};
 }
 
-// Gives the game back its own fov/aspect unless it changed them itself meanwhile.
-void restore_game_projection(CameraData* data) {
-    if (!g_overriding) {
-        return;
-    }
-    if (field<float>(data, k_fov) == g_written_fov) {
-        field<float>(data, k_fov) = g_game_fov;
-    }
-    if (field<float>(data, k_aspect) == g_written_aspect) {
-        field<float>(data, k_aspect) = g_game_aspect;
-    }
-    field<int>(data, k_projection_dirty) = 1;
-    g_overriding = false;
-}
-
 void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* target, const Vec4* up,
                               int save_previous, int update_frustum) {
     const auto camera = CameraGame::get();
@@ -83,18 +66,19 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
         return;
     }
 
-    // The game's own projection parameters for this frame.
-    if (!g_overriding || field<float>(data, k_fov) != g_written_fov) {
-        g_game_fov = field<float>(data, k_fov);
-    }
-    if (!g_overriding || field<float>(data, k_aspect) != g_written_aspect) {
-        g_game_aspect = field<float>(data, k_aspect);
-    }
+    // The game's own fov/aspect: our wide values are only present during the
+    // original call below, because the camera controller eases from the stored fov
+    // and per-object LOD reads it (NieRVR's notes found both).
+    const float game_fov = field<float>(data, k_fov);
+    const float game_aspect = field<float>(data, k_aspect);
 
     xr::trace("update");
     xr::RenderView view;
-    if (g_game_aspect <= 0.0f || !xr::begin_render_view(g_game_aspect, view)) {
-        restore_game_projection(data);
+    if (game_aspect <= 0.0f || !xr::begin_render_view(game_aspect, view)) {
+        if (g_projection_is_ours) {
+            field<int>(data, k_projection_dirty) = 1; // rebuild the game's own projection
+            g_projection_is_ours = false;
+        }
         g_have_last = false;
         g_original(holder, eye, target, up, save_previous, update_frustum);
         return;
@@ -133,12 +117,9 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
     // everything the headset can see.
     const float half_width = std::max(-view.tan_left, view.tan_right);
     const float half_height = std::max(view.tan_up, -view.tan_down);
-    g_written_fov = 2.0f * std::atan(half_height);
-    g_written_aspect = half_width / half_height;
-    field<float>(data, k_fov) = g_written_fov;
-    field<float>(data, k_aspect) = g_written_aspect;
+    field<float>(data, k_fov) = 2.0f * std::atan(half_height);
+    field<float>(data, k_aspect) = half_width / half_height;
     field<int>(data, k_projection_dirty) = 1;
-    g_overriding = true;
 
     // Motion blur / TAA compare against the previous frame as it was rendered.
     if (save_previous && g_have_last) {
@@ -147,6 +128,8 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
     }
 
     g_original(holder, &vr_eye, &vr_target, &vr_up, save_previous, update_frustum);
+    field<float>(data, k_fov) = game_fov;
+    field<float>(data, k_aspect) = game_aspect;
 
     // Swap the symmetric projection for the headset's asymmetric one (x/y terms only;
     // the game's depth terms stay) and rebuild view*projection.
@@ -159,6 +142,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
     view_projection = math::multiply(matrix(data, 0x00), projection);
     g_last_view_projection = view_projection;
     g_have_last = true;
+    g_projection_is_ours = true;
 }
 } // namespace
 
