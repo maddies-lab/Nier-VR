@@ -23,6 +23,7 @@ struct SlotState {
     HANDLE handle = nullptr;
     uint64_t game_value = 0; // game_fence value once the game's write is done
     uint64_t xr_value = 0;   // xr_fence value once the XR side's last read is done
+    FrameMeta meta;
 };
 
 // Shared between the threads, guarded by g_mutex.
@@ -136,7 +137,7 @@ bool ensure_game_textures(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& back
 
     std::scoped_lock _{g_mutex};
     for (int i = 0; i < k_slots; ++i) {
-        g_slots[i] = {handles[i], 0, 0};
+        g_slots[i] = {handles[i], 0, 0, {}};
     }
     g_width = desc.Width;
     g_height = desc.Height;
@@ -177,7 +178,8 @@ bool open_xr_fences(ID3D11Device* device) {
 }
 } // namespace
 
-bool publish(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer) {
+bool publish(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer,
+             const FrameMeta& meta) {
     if (!g_game.initialized) {
         init_game_side(device, context);
     }
@@ -219,6 +221,7 @@ bool publish(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D
 
     std::scoped_lock _{g_mutex};
     g_slots[slot].game_value = g_game.game_value;
+    g_slots[slot].meta = meta;
     g_newest = slot;
     ++g_sequence;
     return true;
@@ -232,7 +235,8 @@ std::optional<Frame> claim_newest(ID3D11Device* device) {
         if (g_newest < 0 || g_sequence == g_xr.last_sequence) {
             return std::nullopt;
         }
-        frame = {g_newest, g_generation, g_slots[g_newest].game_value, g_width, g_height, g_format};
+        frame = {g_newest, g_generation, g_slots[g_newest].game_value, g_width, g_height, g_format,
+                 g_slots[g_newest].meta};
         for (int i = 0; i < k_slots; ++i) {
             handles[i] = g_slots[i].handle;
         }

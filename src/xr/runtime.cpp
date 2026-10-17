@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -92,6 +93,34 @@ uint32_t g_swapchain_width = 0, g_swapchain_height = 0;
 DXGI_FORMAT g_swapchain_source_format = DXGI_FORMAT_UNKNOWN;
 bool g_image_ready = false; // the swapchain holds at least one released game frame
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
+transport::FrameMeta g_image_meta; // how the image currently in the swapchain was rendered
+
+// Written by the XR thread, read by game threads in begin_render_view.
+std::mutex g_view_mutex;
+XrFovf g_eye_fov[2]{};
+bool g_have_eye_fov = false;
+float g_reference_yaw = 0.0f;        // head yaw that maps to the game camera's forward
+math::Vec3 g_reference_position{};   // head position that maps to the game camera's eye
+std::atomic<int64_t> g_predicted_time{0};
+std::atomic<int64_t> g_predicted_period{0};
+std::atomic<bool> g_head_tracking{false};
+
+// The view rendered this frame (game threads), sent with the frame at Present.
+std::mutex g_frame_meta_mutex;
+transport::FrameMeta g_frame_meta;
+bool g_frame_meta_valid = false;
+bool g_head_tracking_key_was_down = false; // render thread only
+
+// Render thread: hysteresis between theater and projected presentation, so screens
+// that update the main camera only on some frames (pause menu map) don't flicker.
+constexpr int k_projected_enter_frames = 3;
+constexpr int k_projected_leave_frames = 10;
+bool g_presenting_projected = false;
+int g_meta_streak = 0, g_miss_streak = 0;
+transport::FrameMeta g_last_meta;
+
+// Frame-order trace (camera update vs Present), armed by F7.
+std::atomic<int> g_trace_remaining{0};
 
 std::string result_string(XrResult result) {
     char buffer[XR_MAX_RESULT_STRING_SIZE]{};
@@ -430,6 +459,7 @@ void consume_game_frame() {
         transport::release(*frame);
     } else {
         transport::copy_and_release(*frame, g_xr_context, g_images.at(index));
+        g_image_meta = frame->meta;
     }
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -438,7 +468,8 @@ void consume_game_frame() {
     }
 }
 
-// Puts the screen straight ahead of the head, level, yaw only.
+// Puts the screen straight ahead of the head, level, yaw only, and makes this head
+// pose the reference that maps onto the game camera in head-tracked mode.
 void place_screen(XrTime time) {
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
     if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
@@ -457,6 +488,11 @@ void place_screen(XrTime time) {
     g_screen_pose.orientation = {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
     g_screen_pose.position = {head.x - std::sin(yaw) * k_screen_distance, head.y,
                               head.z - std::cos(yaw) * k_screen_distance};
+    {
+        std::scoped_lock _{g_view_mutex};
+        g_reference_yaw = yaw;
+        g_reference_position = {head.x, head.y, head.z};
+    }
     g_recenter = false;
     logger::info("[xr] screen placed at %.2f %.2f %.2f, yaw %.1f deg", g_screen_pose.position.x,
                  g_screen_pose.position.y, g_screen_pose.position.z, yaw * 57.29578f);
@@ -511,6 +547,23 @@ void xr_thread() {
             Sleep(100);
             continue;
         }
+        g_predicted_time = frame.predictedDisplayTime;
+        g_predicted_period = frame.predictedDisplayPeriod;
+
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = frame.predictedDisplayTime;
+        locate.space = g_local;
+        XrViewState view_state{XR_TYPE_VIEW_STATE};
+        XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t view_count = 0;
+        if (XR_SUCCEEDED(fn::xrLocateViews(g_session, &locate, &view_state, 2, &view_count, views)) &&
+            view_count == 2) {
+            std::scoped_lock _{g_view_mutex};
+            g_eye_fov[0] = views[0].fov;
+            g_eye_fov[1] = views[1].fov;
+            g_have_eye_fov = true;
+        }
 
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
         start = Clock::now();
@@ -524,22 +577,49 @@ void xr_thread() {
         consume_game_frame();
         copy_time.add(ms_since(start));
 
+        if (g_recenter && frame.shouldRender) {
+            place_screen(frame.predictedDisplayTime);
+        }
+
         // Re-submitting the last released image is valid when the game has not
         // produced a new frame since the previous headset frame.
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad)};
+        XrCompositionLayerProjectionView projection_views[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                             {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        const XrCompositionLayerBaseHeader* layers[1]{};
         uint32_t layer_count = 0;
         if (frame.shouldRender && g_image_ready) {
-            if (g_recenter) {
-                place_screen(frame.predictedDisplayTime);
+            XrSwapchainSubImage image{};
+            image.swapchain = g_swapchain;
+            image.imageRect = {{0, 0}, {static_cast<int32_t>(g_swapchain_width), static_cast<int32_t>(g_swapchain_height)}};
+
+            const auto& meta = g_image_meta;
+            if (meta.projected) {
+                // M2 is mono: both eyes get the one image, rendered from the head pose
+                // with a frustum covering both eyes; the compositor reprojects it.
+                XrPosef pose{};
+                pose.orientation = {meta.orientation[0], meta.orientation[1], meta.orientation[2], meta.orientation[3]};
+                pose.position = {meta.position[0], meta.position[1], meta.position[2]};
+                const XrFovf fov{std::atan(meta.tan_left), std::atan(meta.tan_right), std::atan(meta.tan_up),
+                                 std::atan(meta.tan_down)};
+                for (auto& view : projection_views) {
+                    view.pose = pose;
+                    view.fov = fov;
+                    view.subImage = image;
+                }
+                projection.space = g_local;
+                projection.viewCount = 2;
+                projection.views = projection_views;
+                layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
+            } else {
+                quad.space = g_local;
+                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quad.subImage = image;
+                quad.pose = g_screen_pose;
+                quad.size = {k_screen_width, k_screen_width * g_swapchain_height / g_swapchain_width};
+                layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
             }
-            quad.space = g_local;
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain = g_swapchain;
-            quad.subImage.imageRect = {
-                {0, 0}, {static_cast<int32_t>(g_swapchain_width), static_cast<int32_t>(g_swapchain_height)}};
-            quad.pose = g_screen_pose;
-            quad.size = {k_screen_width, k_screen_width * g_swapchain_height / g_swapchain_width};
             layer_count = 1;
         }
 
@@ -554,6 +634,10 @@ void xr_thread() {
         if (check(ended, "xrEndFrame")) {
             ++frames;
         }
+        if (layer_count > 0 && g_image_meta.projected != g_status.projected) {
+            std::scoped_lock _{g_status_mutex};
+            g_status.projected = g_image_meta.projected;
+        }
     }
 }
 
@@ -566,7 +650,32 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
     if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
         return false;
     }
-    const bool ok = transport::publish(g_game_device, g_game_context, backbuffer);
+    std::optional<transport::FrameMeta> fresh;
+    {
+        std::scoped_lock _{g_frame_meta_mutex};
+        if (g_frame_meta_valid) {
+            fresh = g_frame_meta;
+            g_frame_meta_valid = false;
+        }
+    }
+
+    if (fresh) {
+        ++g_meta_streak;
+        g_miss_streak = 0;
+        g_last_meta = *fresh;
+    } else {
+        ++g_miss_streak;
+        g_meta_streak = 0;
+    }
+    if (!g_presenting_projected && g_meta_streak >= k_projected_enter_frames) {
+        g_presenting_projected = true;
+    } else if (g_presenting_projected && g_miss_streak >= k_projected_leave_frames) {
+        g_presenting_projected = false;
+    }
+    // A frame without its own pose reuses the last one (slightly stale, never a mode flip).
+    const transport::FrameMeta meta = g_presenting_projected ? (fresh ? *fresh : g_last_meta) : transport::FrameMeta{};
+
+    const bool ok = transport::publish(g_game_device, g_game_context, backbuffer, meta);
     backbuffer->Release();
     return ok;
 }
@@ -590,6 +699,17 @@ void on_present(IDXGISwapChain* swapchain) {
     }
     g_recenter_key_was_down = recenter_down;
 
+    const bool head_tracking_down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (head_tracking_down && !g_head_tracking_key_was_down) {
+        g_head_tracking = !g_head_tracking;
+        g_recenter = true;
+        g_trace_remaining = 40;
+        logger::info("[xr] head tracking %s", g_head_tracking ? "on" : "off");
+    }
+    g_head_tracking_key_was_down = head_tracking_down;
+
+    trace("present");
+
     if (g_running) {
         const auto start = Clock::now();
         if (hand_over_frame(swapchain)) {
@@ -606,14 +726,100 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.dropped_fps = static_cast<float>(g_dropped_frames * 1000.0 / elapsed);
         g_status.game_copy = g_game_copy_time.take();
         g_status.transport = transport::description();
+        g_status.head_tracking = g_head_tracking;
         g_game_frames = 0;
         g_dropped_frames = 0;
         g_game_window_start = Clock::now();
     }
 }
 
+void trace(const char* event) {
+    if (g_trace_remaining.load() > 0 && g_trace_remaining.fetch_sub(1) > 0) {
+        LARGE_INTEGER now, frequency;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        logger::info("[trace] %-8s thread %5lu  t=%.3f ms", event, GetCurrentThreadId(),
+                     now.QuadPart * 1000.0 / frequency.QuadPart);
+    }
+}
+
 void request_recenter() {
     g_recenter = true;
+}
+
+bool begin_render_view(float aspect, RenderView& view) {
+    const XrTime predicted = g_predicted_time;
+    if (!g_head_tracking || !g_running || predicted == 0) {
+        return false;
+    }
+
+    // The frame rendered now reaches the compositor about one headset frame later.
+    const XrTime time = predicted + g_predicted_period;
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
+        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
+        return false;
+    }
+
+    XrFovf fov[2];
+    float reference_yaw;
+    math::Vec3 reference_position;
+    {
+        std::scoped_lock _{g_view_mutex};
+        if (!g_have_eye_fov) {
+            return false;
+        }
+        fov[0] = g_eye_fov[0];
+        fov[1] = g_eye_fov[1];
+        reference_yaw = g_reference_yaw;
+        reference_position = g_reference_position;
+    }
+
+    const auto& o = location.pose.orientation;
+    const auto& p = location.pose.position;
+    const math::Quat head{o.x, o.y, o.z, o.w};
+    const math::Vec3 head_position{p.x, p.y, p.z};
+    const math::Quat to_reference = math::yaw_rotation(-reference_yaw);
+    view.head_orientation = to_reference * head;
+    view.head_position = math::rotate(to_reference, head_position - reference_position);
+
+    // One frustum covering both eyes, widened to the game's aspect.
+    float left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
+    float right = std::max(std::tan(fov[0].angleRight), std::tan(fov[1].angleRight));
+    float up = std::max(std::tan(fov[0].angleUp), std::tan(fov[1].angleUp));
+    float down = std::min(std::tan(fov[0].angleDown), std::tan(fov[1].angleDown));
+    const float width = right - left, height = up - down;
+    if (width / height < aspect) {
+        const float extra = (aspect * height - width) * 0.5f;
+        left -= extra;
+        right += extra;
+    } else {
+        const float extra = (width / aspect - height) * 0.5f;
+        up += extra;
+        down -= extra;
+    }
+    view.tan_left = left;
+    view.tan_right = right;
+    view.tan_up = up;
+    view.tan_down = down;
+
+    transport::FrameMeta meta;
+    meta.projected = true;
+    meta.orientation[0] = o.x;
+    meta.orientation[1] = o.y;
+    meta.orientation[2] = o.z;
+    meta.orientation[3] = o.w;
+    meta.position[0] = p.x;
+    meta.position[1] = p.y;
+    meta.position[2] = p.z;
+    meta.tan_left = left;
+    meta.tan_right = right;
+    meta.tan_up = up;
+    meta.tan_down = down;
+    std::scoped_lock _{g_frame_meta_mutex};
+    g_frame_meta = meta;
+    g_frame_meta_valid = true;
+    return true;
 }
 
 Status status() {

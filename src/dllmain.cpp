@@ -6,6 +6,7 @@
 
 #include "game/build.hpp"
 #include "game/camera.hpp"
+#include "game/camera_hook.hpp"
 #include "game/dump.hpp"
 #include "hooks/d3d11_hook.hpp"
 #include "log.hpp"
@@ -46,6 +47,8 @@ DWORD WINAPI init_thread(LPVOID) {
         game::dump_executable(out);
     }
 
+    game::camera_hook::install();
+
     hooks::install_d3d11({
         // The overlay draws first so it is visible on the virtual screen too.
         .on_present =
@@ -62,6 +65,17 @@ DWORD WINAPI init_thread(LPVOID) {
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
+
+        // Other processes in the Proton prefix (e.g. its steam.exe helper) can pick up
+        // this DLL too; they only get the forwarding.
+        wchar_t exe_path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        const std::wstring exe{exe_path};
+        const auto name = exe.substr(exe.find_last_of(L"\\/") + 1);
+        if (_wcsicmp(name.c_str(), L"NieRAutomata.exe") != 0) {
+            return proxy::load_system_dll() ? TRUE : FALSE;
+        }
+
         logger::open();
         logger::info("NieR-VR loaded");
 

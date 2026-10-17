@@ -98,7 +98,7 @@ bool install_d3d11(D3D11Callbacks callbacks) {
         return false;
     }
 
-    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+    if (MH_EnableHook(present) != MH_OK || MH_EnableHook(resize) != MH_OK) {
         logger::error("[d3d11] MH_EnableHook failed");
         return false;
     }

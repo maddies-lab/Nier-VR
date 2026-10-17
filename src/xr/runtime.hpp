@@ -5,6 +5,8 @@
 
 #include <dxgi.h>
 
+#include "math.hpp"
+
 // OpenXR session and the M1 "theater" presentation: the game's backbuffer is
 // shown on a world-locked quad in front of the player.
 namespace xr {
@@ -18,6 +20,8 @@ struct Status {
     std::string system;          // headset name
     const char* state = "not started";
     const char* transport = "-"; // how frames cross from the game's device to the XR device
+    bool head_tracking = false;  // F7
+    bool projected = false;      // last submitted frame used a projection layer
     std::string last_error;
     uint32_t width = 0, height = 0;
 
@@ -32,8 +36,25 @@ struct Status {
 // Call from the game's Present (render thread). Starts the XR thread on first use.
 void on_present(IDXGISwapChain* swapchain);
 
-// Places the screen in front of the current head pose on the next frame.
+// Places the screen in front of the current head pose on the next frame; in
+// head-tracked mode, also makes the current head yaw the game camera's forward.
 void request_recenter();
 
+// Head-tracked rendering (M2). F7 toggles it.
+struct RenderView {
+    math::Quat head_orientation; // relative to the recentered reference (yaw removed)
+    math::Vec3 head_position;    // metres, relative to the reference, in the reference's frame
+    // Render frustum as tangents (left/down negative), widened to the game's aspect.
+    float tan_left = 0, tan_right = 0, tan_up = 0, tan_down = 0;
+};
+
+// Game thread. When head tracking is on and the headset is tracking, samples the head
+// pose predicted for this frame's display and returns the view to render. The pose is
+// remembered and sent with this frame to the compositor.
+bool begin_render_view(float aspect, RenderView& view);
+
 Status status();
+
+// Logs a timestamped event with its thread for a short window after F7 (frame-order debugging).
+void trace(const char* event);
 } // namespace xr

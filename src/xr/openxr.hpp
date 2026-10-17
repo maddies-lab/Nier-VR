@@ -24,6 +24,7 @@
     X(xrPollEvent)                         \
     X(xrCreateReferenceSpace)              \
     X(xrLocateSpace)                       \
+    X(xrLocateViews)                       \
     X(xrEnumerateSwapchainFormats)         \
     X(xrCreateSwapchain)                   \
     X(xrDestroySwapchain)                  \
