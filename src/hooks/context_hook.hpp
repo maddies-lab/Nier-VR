@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <d3d11.h>
 
 // Hooks on the game's immediate context (Map, Unmap, Draw, DrawIndexed) shared by
@@ -26,4 +28,8 @@ void set_draw_observation(bool enabled);
 HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped);
 void unmap_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource);
+
+// Total QPC ticks the calling thread has spent inside Map(D3D11_MAP_READ*) calls
+// (CPU waiting for the GPU on read-backs).
+uint64_t read_map_ticks();
 } // namespace hooks::context

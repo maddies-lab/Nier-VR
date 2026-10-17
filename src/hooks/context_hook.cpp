@@ -29,6 +29,7 @@ std::atomic<bool> g_installed{false};
 Observer g_observers[4];
 std::atomic<int> g_observer_count{0};
 std::atomic<bool> g_observe_draws{false};
+thread_local uint64_t t_read_map_ticks = 0;
 
 void notify_draw(const char* kind) {
     if (!g_observe_draws) {
@@ -53,7 +54,16 @@ void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
 
 HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                               UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
+    const bool read = type == D3D11_MAP_READ || type == D3D11_MAP_READ_WRITE;
+    LARGE_INTEGER before{}, after{};
+    if (read) {
+        QueryPerformanceCounter(&before);
+    }
     const auto hr = g_map(self, resource, subresource, type, flags, mapped);
+    if (read) {
+        QueryPerformanceCounter(&after);
+        t_read_map_ticks += after.QuadPart - before.QuadPart;
+    }
     for (int i = 0; i < g_observer_count; ++i) {
         if (g_observers[i].on_map) {
             g_observers[i].on_map(resource, type, mapped, hr);
@@ -108,7 +118,11 @@ void set_draw_observation(bool enabled) {
 
 HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    return (g_map ? g_map : nullptr)(context, resource, subresource, type, flags, mapped);
+    return g_map(context, resource, subresource, type, flags, mapped);
+}
+
+uint64_t read_map_ticks() {
+    return t_read_map_ticks;
 }
 
 void unmap_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource) {

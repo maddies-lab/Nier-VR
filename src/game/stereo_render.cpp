@@ -77,6 +77,95 @@ void on_unmap(ID3D11Resource* resource) {
 
 std::atomic<uint64_t> g_doubled{0}, g_single{0};
 
+// Per-pass timing, logged every 300 doubled frames: CPU time of each job run, the
+// part of it spent waiting in Map(READ), and GPU time from timestamp queries.
+struct PassTimes {
+    double cpu_ms = 0, read_wait_ms = 0, gpu_ms = 0;
+    uint32_t gpu_samples = 0;
+};
+PassTimes g_left, g_right;
+uint32_t g_timed_frames = 0;
+
+constexpr int k_query_ring = 4;
+struct GpuQueries {
+    ID3D11Query* disjoint = nullptr;
+    ID3D11Query* stamps[3]{}; // start, after left, after right
+    bool pending = false;
+};
+GpuQueries g_queries[k_query_ring];
+int g_query_index = 0;
+bool g_queries_ready = false;
+
+double qpc_ms(int64_t ticks) {
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    return ticks * 1000.0 / frequency.QuadPart;
+}
+
+void create_queries(ID3D11DeviceContext* context) {
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    D3D11_QUERY_DESC disjoint{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+    D3D11_QUERY_DESC stamp{D3D11_QUERY_TIMESTAMP, 0};
+    bool ok = device != nullptr;
+    for (auto& q : g_queries) {
+        ok = ok && SUCCEEDED(device->CreateQuery(&disjoint, &q.disjoint));
+        for (auto& s : q.stamps) {
+            ok = ok && SUCCEEDED(device->CreateQuery(&stamp, &s));
+        }
+    }
+    if (device != nullptr) {
+        device->Release();
+    }
+    g_queries_ready = ok;
+    if (!ok) {
+        logger::warn("[stereo] GPU timestamp queries unavailable");
+    }
+}
+
+// Reads finished query sets without waiting.
+void collect_gpu_times(ID3D11DeviceContext* context) {
+    for (auto& q : g_queries) {
+        if (!q.pending) {
+            continue;
+        }
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+        UINT64 stamps[3]{};
+        if (context->GetData(q.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+            continue;
+        }
+        bool ready = true;
+        for (int i = 0; i < 3 && ready; ++i) {
+            ready = context->GetData(q.stamps[i], &stamps[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        }
+        if (!ready) {
+            continue;
+        }
+        q.pending = false;
+        if (!disjoint.Disjoint && disjoint.Frequency != 0) {
+            g_left.gpu_ms += (stamps[1] - stamps[0]) * 1000.0 / disjoint.Frequency;
+            g_right.gpu_ms += (stamps[2] - stamps[1]) * 1000.0 / disjoint.Frequency;
+            ++g_left.gpu_samples;
+            ++g_right.gpu_samples;
+        }
+    }
+}
+
+void report_times() {
+    if (++g_timed_frames < 300) {
+        return;
+    }
+    const auto avg = [](double total, uint32_t n) { return n > 0 ? total / n : 0.0; };
+    logger::info("[stereo] per frame: left eye cpu %.2f ms (read-back wait %.2f) gpu %.2f ms | right eye cpu %.2f ms "
+                 "(read-back wait %.2f) gpu %.2f ms",
+                 g_left.cpu_ms / g_timed_frames, g_left.read_wait_ms / g_timed_frames,
+                 avg(g_left.gpu_ms, g_left.gpu_samples), g_right.cpu_ms / g_timed_frames,
+                 g_right.read_wait_ms / g_timed_frames, avg(g_right.gpu_ms, g_right.gpu_samples));
+    g_left = {};
+    g_right = {};
+    g_timed_frames = 0;
+}
+
 void __fastcall draw_job_detour(void* device) {
     xr::JobViews views;
     const auto scene_buffer = g_scene_buffer.load();
@@ -87,8 +176,27 @@ void __fastcall draw_job_detour(void* device) {
         return;
     }
 
+    if (!g_queries_ready) {
+        create_queries(context);
+    }
+    collect_gpu_times(context);
+    auto& queries = g_queries[g_query_index];
+    const bool timing = g_queries_ready && !queries.pending;
+    if (timing) {
+        context->Begin(queries.disjoint);
+        context->End(queries.stamps[0]);
+    }
+
     // Left eye: the queue as recorded and uploaded.
+    LARGE_INTEGER t0, t1, t2;
+    uint64_t wait0 = hooks::context::read_map_ticks();
+    QueryPerformanceCounter(&t0);
     g_draw_job(device);
+    QueryPerformanceCounter(&t1);
+    const uint64_t wait1 = hooks::context::read_map_ticks();
+    if (timing) {
+        context->End(queries.stamps[1]);
+    }
     xr::publish_from_job(views.primary);
 
     // Right eye: same queue, the main camera's SceneBuffer re-uploaded.
@@ -98,8 +206,25 @@ void __fastcall draw_job_detour(void* device) {
     }
     std::memcpy(mapped.pData, views.secondary_scene, sizeof(views.secondary_scene));
     hooks::context::unmap_original(context, scene_buffer, 0);
+    const uint64_t wait2 = hooks::context::read_map_ticks();
+    LARGE_INTEGER t3;
+    QueryPerformanceCounter(&t2);
     g_draw_job(device);
+    QueryPerformanceCounter(&t3);
+    const uint64_t wait3 = hooks::context::read_map_ticks();
+    if (timing) {
+        context->End(queries.stamps[2]);
+        context->End(queries.disjoint);
+        queries.pending = true;
+        g_query_index = (g_query_index + 1) % k_query_ring;
+    }
     xr::mark_both_rendered(views.sequence);
+
+    g_left.cpu_ms += qpc_ms(t1.QuadPart - t0.QuadPart);
+    g_left.read_wait_ms += qpc_ms(static_cast<int64_t>(wait1 - wait0));
+    g_right.cpu_ms += qpc_ms(t3.QuadPart - t2.QuadPart);
+    g_right.read_wait_ms += qpc_ms(static_cast<int64_t>(wait3 - wait2));
+    report_times();
 
     if (++g_doubled == 1) {
         logger::info("[stereo] first frame drawn for both eyes");
