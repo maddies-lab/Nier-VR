@@ -49,6 +49,8 @@ add_library(nier_vr SHARED
     src/game/build.cpp
     src/game/camera.cpp
     src/game/dump.cpp
+    src/game/inspect.cpp
+    src/game/watch.cpp
     src/hooks/d3d11_hook.cpp
     src/proxy/proxy.cpp
     src/xr/frame_transport.cpp
