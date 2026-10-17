@@ -876,12 +876,18 @@ bool begin_render_view(float aspect, RenderView& view) {
 
     float left, right, up, down;
     if (eye >= 0) {
-        // Stereo: the eye's own frustum squeezed into the game's 16:9 frame
-        // (anamorphic); the compositor maps it back by the submitted fov.
-        left = std::tan(fov[0].angleLeft);
-        right = std::tan(fov[0].angleRight);
-        up = std::tan(fov[0].angleUp);
-        down = std::tan(fov[0].angleDown);
+        // Stereo: a symmetric frustum just covering the eye's asymmetric one, squeezed
+        // into the game's 16:9 frame (anamorphic; the compositor maps it back by the
+        // submitted fov). Symmetric because the game's screen-space passes (shadow
+        // mask, lighting, AO) rebuild positions from depth with
+        // g_CameraParam = (near, far, tan(hfov/2), tan(vfov/2)), which assumes a
+        // centred frustum: per-eye asymmetric frustums put shadows in the wrong place.
+        const float half_width = std::max(-std::tan(fov[0].angleLeft), std::tan(fov[0].angleRight));
+        const float half_height = std::max(std::tan(fov[0].angleUp), -std::tan(fov[0].angleDown));
+        left = -half_width;
+        right = half_width;
+        up = half_height;
+        down = -half_height;
     } else {
         // Mono: one frustum covering both eyes, widened to the game's aspect.
         left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
