@@ -6,6 +6,7 @@
 
 #include "game/build.hpp"
 #include "game/census.hpp"
+#include "game/stereo_render.hpp"
 #include "game/camera.hpp"
 #include "game/inspect.hpp"
 #include "game/watch.hpp"
@@ -89,7 +90,7 @@ void draw_window(IDXGISwapChain* swapchain) {
 
     const auto vr = xr::status();
     ImGui::Text("OpenXR: %s   F7 head tracking: %s   F5 render: %s   showing: %s", vr.state,
-                vr.head_tracking ? "on" : "off", vr.stereo ? "stereo (alternate eyes)" : "mono", vr.presentation);
+                vr.head_tracking ? "on" : "off", vr.stereo_mode, vr.presentation);
     if (vr.head_tracking) {
         ImGui::Text("  F6 pose pairing: %s", vr.pairing ? "previous Present (pipelined)" : "newest");
     }
@@ -138,6 +139,7 @@ void on_present(IDXGISwapChain* swapchain) {
 
     ++g_frame;
     game::census::on_present(g_context);
+    game::stereo_render::on_present(g_context);
     const bool toggle_down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
     if (toggle_down && !g_toggle_was_down) {
         g_visible = !g_visible;

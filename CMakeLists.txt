@@ -50,9 +50,11 @@ add_library(nier_vr SHARED
     src/game/camera.cpp
     src/game/camera_hook.cpp
     src/game/census.cpp
+    src/game/stereo_render.cpp
     src/game/dump.cpp
     src/game/inspect.cpp
     src/game/watch.cpp
+    src/hooks/context_hook.cpp
     src/hooks/d3d11_hook.cpp
     src/proxy/proxy.cpp
     src/xr/frame_transport.cpp

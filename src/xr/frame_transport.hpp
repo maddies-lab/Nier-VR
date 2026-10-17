@@ -18,6 +18,8 @@
 // (DXVK's keyed mutex was tried first: its ReleaseSync makes the CPU wait for the
 // GPU to finish the game's whole frame, up to 60 ms in heavy scenes.)
 namespace xr::transport {
+constexpr int k_channels = 2; // 0 = left eye / mono / theater, 1 = right eye
+
 // How the XR side should present a frame.
 struct FrameMeta {
     bool projected = false;                    // false: theater quad; true: projection layer
@@ -34,14 +36,16 @@ struct Frame {
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     FrameMeta meta;
+    int channel = 0;
 };
 
-// Render thread. Copies the backbuffer into a free slot and publishes it.
-bool publish(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer,
+// Game side (the game's immediate context). Copies the backbuffer into a free slot
+// of the channel and publishes it.
+bool publish(int channel, ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer,
              const FrameMeta& meta);
 
-// XR thread. Claims the newest frame if it has not been consumed yet.
-std::optional<Frame> claim_newest(ID3D11Device* device);
+// XR thread. Claims the channel's newest frame if it has not been consumed yet.
+std::optional<Frame> claim_newest(int channel, ID3D11Device* device);
 
 // XR thread. Copies a claimed frame into `destination` and releases the claim.
 void copy_and_release(const Frame& frame, ID3D11DeviceContext* context, ID3D11Texture2D* destination);

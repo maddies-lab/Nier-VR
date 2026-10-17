@@ -8,6 +8,7 @@
 #include "game/camera.hpp"
 #include "game/camera_hook.hpp"
 #include "game/dump.hpp"
+#include "game/stereo_render.hpp"
 #include "hooks/d3d11_hook.hpp"
 #include "log.hpp"
 #include "overlay.hpp"
@@ -48,6 +49,7 @@ DWORD WINAPI init_thread(LPVOID) {
     }
 
     game::camera_hook::install();
+    game::stereo_render::install();
 
     hooks::install_d3d11({
         // The overlay draws first so it is visible on the virtual screen too.

@@ -9,33 +9,17 @@
 
 #include <windows.h>
 
-#include <MinHook.h>
-
+#include "hooks/context_hook.hpp"
 #include "log.hpp"
 
 namespace game::census {
 namespace {
-// ID3D11DeviceContext vtable slots.
-constexpr size_t k_draw_indexed = 12;
-constexpr size_t k_draw = 13;
-constexpr size_t k_map = 14;
-constexpr size_t k_unmap = 15;
 constexpr size_t k_depth = 10; // return addresses kept per call path
-
-using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
-using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
-using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
-                                          D3D11_MAPPED_SUBRESOURCE*);
-using UnmapFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
-UnmapFn g_unmap = nullptr;
-DrawIndexedFn g_draw_indexed = nullptr;
-DrawFn g_draw = nullptr;
-MapFn g_map = nullptr;
-bool g_hooked = false;
 
 enum class State { idle, armed, recording };
 State g_state = State::idle; // render thread
 bool g_key_was_down = false;
+bool g_registered = false;
 
 struct Path {
     uint32_t count = 0;
@@ -76,25 +60,15 @@ void record(const char* kind) {
     ++g_calls;
 }
 
-void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT start, INT base) {
+void on_draw(const char* kind) {
     if (g_state == State::recording) {
-        record("DrawIndexed");
+        record(kind);
     }
-    g_draw_indexed(self, count, start, base);
 }
 
-void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
-    if (g_state == State::recording) {
-        record("Draw");
-    }
-    g_draw(self, count, start);
-}
-
-HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
-                              UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    const auto hr = g_map(self, resource, subresource, type, flags, mapped);
+void on_map(ID3D11Resource* resource, D3D11_MAP type, const D3D11_MAPPED_SUBRESOURCE* mapped, HRESULT hr) {
     if (g_state != State::recording) {
-        return hr;
+        return;
     }
 
     D3D11_RESOURCE_DIMENSION dimension{};
@@ -112,10 +86,9 @@ HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext* self, ID3D11Resource* resourc
     if (SUCCEEDED(hr) && (size == 256 || size == 32)) {
         t_pending = {resource, mapped->pData, size};
     }
-    return hr;
 }
 
-void STDMETHODCALLTYPE unmap(ID3D11DeviceContext* self, ID3D11Resource* resource, UINT subresource) {
+void on_unmap(ID3D11Resource* resource) {
     if (g_state == State::recording && t_pending.resource == resource && g_dumps < 24) {
         ++g_dumps;
         const auto f = static_cast<const float*>(t_pending.data);
@@ -126,24 +99,6 @@ void STDMETHODCALLTYPE unmap(ID3D11DeviceContext* self, ID3D11Resource* resource
         }
         t_pending = {};
     }
-    g_unmap(self, resource, subresource);
-}
-
-bool install(ID3D11DeviceContext* context) {
-    const auto vtable = *reinterpret_cast<void***>(context);
-    if (MH_CreateHook(vtable[k_draw_indexed], reinterpret_cast<void*>(&draw_indexed),
-                      reinterpret_cast<void**>(&g_draw_indexed)) != MH_OK ||
-        MH_CreateHook(vtable[k_draw], reinterpret_cast<void*>(&draw), reinterpret_cast<void**>(&g_draw)) != MH_OK ||
-        MH_CreateHook(vtable[k_map], reinterpret_cast<void*>(&map), reinterpret_cast<void**>(&g_map)) != MH_OK ||
-        MH_CreateHook(vtable[k_unmap], reinterpret_cast<void*>(&unmap), reinterpret_cast<void**>(&g_unmap)) != MH_OK) {
-        logger::error("[census] could not hook the context");
-        return false;
-    }
-    MH_EnableHook(vtable[k_draw_indexed]);
-    MH_EnableHook(vtable[k_draw]);
-    MH_EnableHook(vtable[k_map]);
-    MH_EnableHook(vtable[k_unmap]);
-    return true;
 }
 
 void report() {
@@ -172,15 +127,21 @@ void on_present(ID3D11DeviceContext* context) {
 
     switch (g_state) {
     case State::idle:
-        if (pressed && (g_hooked || (g_hooked = install(context)))) {
+        if (pressed && hooks::context::install(context)) {
+            if (!g_registered) {
+                hooks::context::add_observer({on_map, on_unmap, on_draw});
+                g_registered = true;
+            }
             g_state = State::armed;
             logger::backtrace("census: Present");
         }
         break;
     case State::armed:
+        hooks::context::set_draw_observation(true);
         g_state = State::recording; // record from this Present to the next
         break;
     case State::recording:
+        hooks::context::set_draw_observation(false);
         g_state = State::idle;
         report();
         break;

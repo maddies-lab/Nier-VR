@@ -108,22 +108,37 @@ math::Vec3 g_reference_position{};   // head position that maps to the game came
 std::atomic<int64_t> g_predicted_time{0};
 std::atomic<int64_t> g_predicted_period{0};
 std::atomic<bool> g_head_tracking{false};
-std::atomic<bool> g_stereo{true}; // F5: alternate-eye stereo (else mono) while head tracking
-int g_next_eye = 0;               // game thread: eye rendered by the next camera update
+// F5 cycles: 0 = mono, 1 = alternate eyes, 2 = both eyes every frame.
+std::atomic<int> g_stereo_mode{2};
+int g_next_eye = 0;               // game thread: alternate mode's next eye
 bool g_stereo_key_was_down = false; // render thread only
 
 // The view rendered this frame (game threads), sent with the frame at Present.
+// What the latest main-camera update rendered (game thread writes).
+struct FrameViews {
+    transport::FrameMeta primary;   // left eye (stereo) or head (mono)
+    transport::FrameMeta secondary; // right eye, both-eyes mode
+    bool both = false;
+    bool has_secondary_scene = false;
+    float secondary_scene[64]{};    // right eye SceneBuffer block
+    uint64_t sequence = 0;          // bumped per camera update
+};
 std::mutex g_frame_meta_mutex;
-transport::FrameMeta g_frame_meta;
-uint64_t g_frame_meta_sequence = 0; // bumped per camera update
+FrameViews g_frame_views;
+
+// The views of the render queue the next draw job executes (latched at Present).
+std::mutex g_job_mutex;
+FrameViews g_job_views;
+bool g_job_enabled = false;
+std::atomic<uint64_t> g_both_rendered_sequence{0};
+IDXGISwapChain* g_game_swapchain = nullptr;
 
 // Render thread: which pose goes with a presented image. The camera update runs
 // on the game's update thread a few ms after each Present, while the render thread
 // draws with the camera from the update before; so by default the pose latched at
 // the previous Present goes with this one (F6 switches to "newest").
 std::atomic<int> g_pairing{1}; // 0 = newest pose, 1 = pose latched at the previous Present
-transport::FrameMeta g_latched_meta;
-uint64_t g_latched_sequence = 0;
+FrameViews g_latched;
 uint64_t g_used_sequence = 0;
 bool g_pairing_key_was_down = false;
 bool g_head_tracking_key_was_down = false; // render thread only
@@ -134,7 +149,7 @@ constexpr int k_projected_enter_frames = 3;
 constexpr int k_projected_leave_frames = 10;
 bool g_presenting_projected = false;
 int g_meta_streak = 0, g_miss_streak = 0;
-transport::FrameMeta g_last_meta;
+transport::FrameMeta g_last_meta, g_last_secondary;
 
 // Frame-order trace (camera update vs Present), armed by F7.
 std::atomic<int> g_trace_remaining{0};
@@ -450,8 +465,8 @@ bool create_swapchain(EyeImage& eye, uint32_t width, uint32_t height, DXGI_FORMA
 }
 
 // Copies the newest game frame into its eye's swapchain, if there is one.
-void consume_game_frame() {
-    const auto frame = transport::claim_newest(g_xr_device);
+void consume_game_frame(int channel) {
+    const auto frame = transport::claim_newest(channel, g_xr_device);
     if (!frame) {
         return;
     }
@@ -607,7 +622,8 @@ void xr_thread() {
         }
 
         start = Clock::now();
-        consume_game_frame();
+        consume_game_frame(0);
+        consume_game_frame(1);
         copy_time.add(ms_since(start));
 
         if (g_recenter && frame.shouldRender) {
@@ -632,7 +648,7 @@ void xr_thread() {
                 fill_projection_view(projection_views[0], left);
                 fill_projection_view(projection_views[1], right);
                 presentation = "stereo";
-            } else if (left.meta.projected && left.meta.eye < 0) {
+            } else if (left.meta.projected && left.meta.eye <= 0) {
                 // Mono: both eyes get the one image, rendered from the head pose with a
                 // frustum covering both eyes; the compositor reprojects it per eye.
                 fill_projection_view(projection_views[0], left);
@@ -684,27 +700,21 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
     if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
         return false;
     }
-    transport::FrameMeta newest;
-    uint64_t newest_sequence;
+    FrameViews newest;
     {
         std::scoped_lock _{g_frame_meta_mutex};
-        newest = g_frame_meta;
-        newest_sequence = g_frame_meta_sequence;
+        newest = g_frame_views;
     }
 
-    transport::FrameMeta candidate = newest;
-    uint64_t candidate_sequence = newest_sequence;
-    if (g_pairing == 1) {
-        candidate = g_latched_meta;
-        candidate_sequence = g_latched_sequence;
-        g_latched_meta = newest;
-        g_latched_sequence = newest_sequence;
-    }
+    // The queue drawn in this iteration was built from the update before the newest
+    // (see g_pairing); the next draw job executes the one built from the newest.
+    const FrameViews candidate = g_pairing == 1 ? g_latched : newest;
+    g_latched = newest;
 
     std::optional<transport::FrameMeta> fresh;
-    if (candidate_sequence != 0 && candidate_sequence != g_used_sequence) {
-        fresh = candidate;
-        g_used_sequence = candidate_sequence;
+    if (candidate.sequence != 0 && candidate.sequence != g_used_sequence) {
+        fresh = candidate.primary;
+        g_used_sequence = candidate.sequence;
     }
 
     if (fresh) {
@@ -720,10 +730,27 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
     } else if (g_presenting_projected && g_miss_streak >= k_projected_leave_frames) {
         g_presenting_projected = false;
     }
-    // A frame without its own pose reuses the last one (slightly stale, never a mode flip).
-    const transport::FrameMeta meta = g_presenting_projected ? (fresh ? *fresh : g_last_meta) : transport::FrameMeta{};
 
-    const bool ok = transport::publish(g_game_device, g_game_context, backbuffer, meta);
+    {
+        std::scoped_lock _{g_job_mutex};
+        g_job_views = newest;
+        g_job_enabled = g_presenting_projected;
+    }
+
+    // Both eyes: the draw job already published the left image; the backbuffer holds
+    // the right one. Otherwise one image: left/alternate eye, head (mono) or theater.
+    bool ok;
+    if (g_presenting_projected && candidate.both && g_both_rendered_sequence == candidate.sequence) {
+        if (fresh) {
+            g_last_secondary = candidate.secondary;
+        }
+        ok = transport::publish(1, g_game_device, g_game_context, backbuffer, g_last_secondary);
+    } else {
+        // A frame without its own pose reuses the last one (slightly stale, never a mode flip).
+        const transport::FrameMeta meta =
+            g_presenting_projected ? (fresh ? *fresh : g_last_meta) : transport::FrameMeta{};
+        ok = transport::publish(0, g_game_device, g_game_context, backbuffer, meta);
+    }
     backbuffer->Release();
     return ok;
 }
@@ -736,6 +763,7 @@ void on_present(IDXGISwapChain* swapchain) {
             return;
         }
         g_game_device->GetImmediateContext(&g_game_context);
+        g_game_swapchain = swapchain;
         // Instance creation can block (wineopenxr waits on Proton's VR setup), so keep it off this thread.
         std::thread{xr_thread}.detach();
         return;
@@ -765,8 +793,8 @@ void on_present(IDXGISwapChain* swapchain) {
 
     const bool stereo_down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (stereo_down && !g_stereo_key_was_down) {
-        g_stereo = !g_stereo;
-        logger::info("[xr] %s", g_stereo ? "stereo (alternate eyes)" : "mono");
+        g_stereo_mode = (g_stereo_mode + 1) % 3;
+        logger::info("[xr] render: %s", stereo_mode_name(g_stereo_mode));
     }
     g_stereo_key_was_down = stereo_down;
 
@@ -794,10 +822,21 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.transport = transport::description();
         g_status.head_tracking = g_head_tracking;
         g_status.pairing = g_pairing;
-        g_status.stereo = g_stereo;
+        g_status.stereo_mode = stereo_mode_name(g_stereo_mode);
         g_game_frames = 0;
         g_dropped_frames = 0;
         g_game_window_start = Clock::now();
+    }
+}
+
+const char* stereo_mode_name(int mode) {
+    switch (mode) {
+    case 0:
+        return "mono";
+    case 1:
+        return "stereo, alternate eyes";
+    default:
+        return "stereo, both eyes";
     }
 }
 
@@ -815,10 +854,55 @@ void request_recenter() {
     g_recenter = true;
 }
 
-bool begin_render_view(float aspect, RenderView& view) {
+namespace {
+transport::FrameMeta make_meta(const XrPosef& pose, int eye, const RenderView& view) {
+    transport::FrameMeta meta;
+    meta.projected = true;
+    meta.eye = eye;
+    meta.orientation[0] = pose.orientation.x;
+    meta.orientation[1] = pose.orientation.y;
+    meta.orientation[2] = pose.orientation.z;
+    meta.orientation[3] = pose.orientation.w;
+    meta.position[0] = pose.position.x;
+    meta.position[1] = pose.position.y;
+    meta.position[2] = pose.position.z;
+    meta.tan_left = view.tan_left;
+    meta.tan_right = view.tan_right;
+    meta.tan_up = view.tan_up;
+    meta.tan_down = view.tan_down;
+    return meta;
+}
+
+void set_relative_pose(RenderView& view, const XrPosef& pose, float reference_yaw, const math::Vec3& reference) {
+    const auto& o = pose.orientation;
+    const auto& p = pose.position;
+    const math::Quat to_reference = math::yaw_rotation(-reference_yaw);
+    view.head_orientation = to_reference * math::Quat{o.x, o.y, o.z, o.w};
+    view.head_position = math::rotate(to_reference, math::Vec3{p.x, p.y, p.z} - reference);
+}
+
+// Smallest symmetric frustum containing the given eye fovs. Symmetric because the
+// game's screen-space passes (shadow mask, lighting, AO) rebuild positions from
+// depth with g_CameraParam = (near, far, tan(hfov/2), tan(vfov/2)), which assumes a
+// centred frustum: asymmetric per-eye frustums put shadows in the wrong place.
+// Squeezed into the game's 16:9 frame (anamorphic); the compositor maps it back.
+void set_symmetric_cover(RenderView& view, const XrFovf* fovs, int count) {
+    float half_width = 0.0f, half_height = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        half_width = std::max({half_width, -std::tan(fovs[i].angleLeft), std::tan(fovs[i].angleRight)});
+        half_height = std::max({half_height, std::tan(fovs[i].angleUp), -std::tan(fovs[i].angleDown)});
+    }
+    view.tan_left = -half_width;
+    view.tan_right = half_width;
+    view.tan_up = half_height;
+    view.tan_down = -half_height;
+}
+} // namespace
+
+int begin_render_views(float aspect, RenderView& primary, RenderView& secondary) {
     const XrTime predicted = g_predicted_time;
     if (!g_head_tracking || !g_running || predicted == 0) {
-        return false;
+        return 0;
     }
 
     // The frame rendered now reaches the compositor about one headset frame later.
@@ -830,7 +914,7 @@ bool begin_render_view(float aspect, RenderView& view) {
     {
         std::scoped_lock _{g_view_mutex};
         if (!g_have_eye_fov) {
-            return false;
+            return 0;
         }
         fov[0] = g_eye_fov[0];
         fov[1] = g_eye_fov[1];
@@ -838,62 +922,21 @@ bool begin_render_view(float aspect, RenderView& view) {
         reference_position = g_reference_position;
     }
 
-    // Pose to render from: one eye per frame in stereo, the head in mono.
-    XrPosef pose{};
-    int eye = -1;
-    if (g_stereo) {
-        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
-        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        locate.displayTime = time;
-        locate.space = g_local;
-        XrViewState state{XR_TYPE_VIEW_STATE};
-        XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-        uint32_t count = 0;
-        if (XR_FAILED(fn::xrLocateViews(g_session, &locate, &state, 2, &count, views)) || count != 2 ||
-            (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
-            return false;
-        }
-        eye = g_next_eye;
-        g_next_eye ^= 1;
-        pose = views[eye].pose;
-        fov[0] = views[eye].fov;
-    } else {
+    const int mode = g_stereo_mode;
+    FrameViews views;
+    int count = 1;
+    if (mode == 0) {
+        // Mono: the head pose, one frustum covering both eyes widened to the game's aspect.
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
         if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
             (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
-            return false;
+            return 0;
         }
-        pose = location.pose;
-    }
-
-    const auto& o = pose.orientation;
-    const auto& p = pose.position;
-    const math::Quat head{o.x, o.y, o.z, o.w};
-    const math::Vec3 head_position{p.x, p.y, p.z};
-    const math::Quat to_reference = math::yaw_rotation(-reference_yaw);
-    view.head_orientation = to_reference * head;
-    view.head_position = math::rotate(to_reference, head_position - reference_position);
-
-    float left, right, up, down;
-    if (eye >= 0) {
-        // Stereo: a symmetric frustum just covering the eye's asymmetric one, squeezed
-        // into the game's 16:9 frame (anamorphic; the compositor maps it back by the
-        // submitted fov). Symmetric because the game's screen-space passes (shadow
-        // mask, lighting, AO) rebuild positions from depth with
-        // g_CameraParam = (near, far, tan(hfov/2), tan(vfov/2)), which assumes a
-        // centred frustum: per-eye asymmetric frustums put shadows in the wrong place.
-        const float half_width = std::max(-std::tan(fov[0].angleLeft), std::tan(fov[0].angleRight));
-        const float half_height = std::max(std::tan(fov[0].angleUp), -std::tan(fov[0].angleDown));
-        left = -half_width;
-        right = half_width;
-        up = half_height;
-        down = -half_height;
-    } else {
-        // Mono: one frustum covering both eyes, widened to the game's aspect.
-        left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
-        right = std::max(std::tan(fov[0].angleRight), std::tan(fov[1].angleRight));
-        up = std::max(std::tan(fov[0].angleUp), std::tan(fov[1].angleUp));
-        down = std::min(std::tan(fov[0].angleDown), std::tan(fov[1].angleDown));
+        set_relative_pose(primary, location.pose, reference_yaw, reference_position);
+        float left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
+        float right = std::max(std::tan(fov[0].angleRight), std::tan(fov[1].angleRight));
+        float up = std::max(std::tan(fov[0].angleUp), std::tan(fov[1].angleUp));
+        float down = std::min(std::tan(fov[0].angleDown), std::tan(fov[1].angleDown));
         const float width = right - left, height = up - down;
         if (width / height < aspect) {
             const float extra = (aspect * height - width) * 0.5f;
@@ -904,30 +947,85 @@ bool begin_render_view(float aspect, RenderView& view) {
             up += extra;
             down -= extra;
         }
+        primary.tan_left = left;
+        primary.tan_right = right;
+        primary.tan_up = up;
+        primary.tan_down = down;
+        views.primary = make_meta(location.pose, -1, primary);
+    } else {
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = time;
+        locate.space = g_local;
+        XrViewState state{XR_TYPE_VIEW_STATE};
+        XrView eyes[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t located = 0;
+        if (XR_FAILED(fn::xrLocateViews(g_session, &locate, &state, 2, &located, eyes)) || located != 2 ||
+            (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+            return 0;
+        }
+        const XrFovf eye_fovs[2] = {eyes[0].fov, eyes[1].fov};
+        if (mode == 1) {
+            // Alternate eyes: one eye per update, its own symmetric cover.
+            const int eye = g_next_eye;
+            g_next_eye ^= 1;
+            set_relative_pose(primary, eyes[eye].pose, reference_yaw, reference_position);
+            set_symmetric_cover(primary, &eye_fovs[eye], 1);
+            views.primary = make_meta(eyes[eye].pose, eye, primary);
+        } else {
+            // Both eyes: left rendered by the game, right by re-running the draw job.
+            // One cover for both, so the projection (and g_CameraParam) is shared.
+            set_relative_pose(primary, eyes[0].pose, reference_yaw, reference_position);
+            set_relative_pose(secondary, eyes[1].pose, reference_yaw, reference_position);
+            set_symmetric_cover(primary, eye_fovs, 2);
+            set_symmetric_cover(secondary, eye_fovs, 2);
+            views.primary = make_meta(eyes[0].pose, 0, primary);
+            views.secondary = make_meta(eyes[1].pose, 1, secondary);
+            views.both = true;
+            count = 2;
+        }
     }
-    view.tan_left = left;
-    view.tan_right = right;
-    view.tan_up = up;
-    view.tan_down = down;
 
-    transport::FrameMeta meta;
-    meta.projected = true;
-    meta.eye = eye;
-    meta.orientation[0] = o.x;
-    meta.orientation[1] = o.y;
-    meta.orientation[2] = o.z;
-    meta.orientation[3] = o.w;
-    meta.position[0] = p.x;
-    meta.position[1] = p.y;
-    meta.position[2] = p.z;
-    meta.tan_left = left;
-    meta.tan_right = right;
-    meta.tan_up = up;
-    meta.tan_down = down;
     std::scoped_lock _{g_frame_meta_mutex};
-    g_frame_meta = meta;
-    ++g_frame_meta_sequence;
+    views.sequence = g_frame_views.sequence + 1;
+    g_frame_views = views;
+    return count;
+}
+
+void set_secondary_scene(const float (&scene)[64]) {
+    std::scoped_lock _{g_frame_meta_mutex};
+    std::copy(std::begin(scene), std::end(scene), g_frame_views.secondary_scene);
+    g_frame_views.has_secondary_scene = true;
+}
+
+bool job_views(JobViews& out) {
+    std::scoped_lock _{g_job_mutex};
+    if (!g_job_enabled || !g_job_views.both || !g_job_views.has_secondary_scene) {
+        return false;
+    }
+    out.sequence = g_job_views.sequence;
+    out.primary = g_job_views.primary;
+    std::copy(std::begin(g_job_views.secondary_scene), std::end(g_job_views.secondary_scene), out.secondary_scene);
     return true;
+}
+
+bool publish_from_job(const transport::FrameMeta& meta) {
+    ID3D11Texture2D* backbuffer = nullptr;
+    if (g_game_swapchain == nullptr ||
+        FAILED(g_game_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
+        return false;
+    }
+    const bool ok = transport::publish(0, g_game_device, g_game_context, backbuffer, meta);
+    backbuffer->Release();
+    return ok;
+}
+
+void mark_both_rendered(uint64_t sequence) {
+    g_both_rendered_sequence = sequence;
+}
+
+ID3D11DeviceContext* game_context() {
+    return g_game_context;
 }
 
 Status status() {

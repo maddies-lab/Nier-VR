@@ -5,7 +5,10 @@
 
 #include <dxgi.h>
 
+#include <d3d11.h>
+
 #include "math.hpp"
+#include "xr/frame_transport.hpp"
 
 // OpenXR session and the M1 "theater" presentation: the game's backbuffer is
 // shown on a world-locked quad in front of the player.
@@ -23,7 +26,7 @@ struct Status {
     bool head_tracking = false;  // F7
     bool projected = false;      // last submitted frame used a projection layer
     const char* presentation = "none"; // "theater", "mono" or "stereo"
-    bool stereo = false;         // F5: alternate-eye stereo while head tracking
+    const char* stereo_mode = "";  // F5
     int pairing = 1;             // F6: 1 = pose from the previous Present, 0 = newest
     std::string last_error;
     uint32_t width = 0, height = 0;
@@ -51,10 +54,30 @@ struct RenderView {
     float tan_left = 0, tan_right = 0, tan_up = 0, tan_down = 0;
 };
 
-// Game thread. When head tracking is on and the headset is tracking, samples the head
-// pose predicted for this frame's display and returns the view to render. The pose is
-// remembered and sent with this frame to the compositor.
-bool begin_render_view(float aspect, RenderView& view);
+// Game thread (main-camera update). When head tracking is on and the headset is
+// tracking, fills the view(s) to render and remembers their poses for this frame's
+// submission. Returns 0 (render normally), 1 (primary only: mono, or one eye in
+// alternate mode) or 2 (both eyes: primary = left, secondary = right).
+int begin_render_views(float aspect, RenderView& primary, RenderView& secondary);
+
+// Game thread, both-eyes mode: the right eye's SceneBuffer block (View, Proj,
+// ViewProj, ViewInverse as the shaders read them) for the frame just begun.
+void set_secondary_scene(const float (&scene)[64]);
+
+// Draw-job thread (both-eyes mode). The views of the render queue being drawn.
+struct JobViews {
+    uint64_t sequence = 0;
+    transport::FrameMeta primary;
+    float secondary_scene[64]{};
+};
+bool job_views(JobViews& out);
+// Copies the backbuffer (the left eye, after the first pass) to the headset.
+bool publish_from_job(const transport::FrameMeta& meta);
+// The second pass ran: the backbuffer at Present is the right eye.
+void mark_both_rendered(uint64_t sequence);
+
+ID3D11DeviceContext* game_context();
+const char* stereo_mode_name(int mode);
 
 Status status();
 
