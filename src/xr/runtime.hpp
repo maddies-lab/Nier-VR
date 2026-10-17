@@ -72,7 +72,7 @@ struct JobViews {
 };
 bool job_views(JobViews& out);
 // Copies the backbuffer (the left eye, after the first pass) to the headset.
-bool publish_from_job(const transport::FrameMeta& meta);
+bool publish_from_job(const transport::FrameMeta& meta, uint64_t sequence);
 // The second pass ran: the backbuffer at Present is the right eye.
 void mark_both_rendered(uint64_t sequence);
 

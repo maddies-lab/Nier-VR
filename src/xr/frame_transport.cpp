@@ -241,29 +241,32 @@ bool publish(int channel_index, ID3D11Device* device, ID3D11DeviceContext* conte
     return true;
 }
 
-std::optional<Frame> claim_newest(int channel_index, ID3D11Device* device) {
+namespace {
+// Caller holds g_mutex. Marks the channel's newest frame claimed and describes it.
+Frame claim_locked(int channel_index, HANDLE (&handles)[k_slots]) {
     auto& channel = g_channels[channel_index];
-    Frame frame;
-    HANDLE handles[k_slots]{};
-    {
-        std::scoped_lock _{g_mutex};
-        if (channel.newest < 0 || channel.sequence == channel.xr_last_sequence) {
-            return std::nullopt;
-        }
-        frame = {channel.newest, channel.generation, channel.slots[channel.newest].game_value, channel.width,
-                 channel.height, channel.format, channel.slots[channel.newest].meta, channel_index};
-        for (int i = 0; i < k_slots; ++i) {
-            handles[i] = channel.slots[i].handle;
-        }
-        channel.claimed = channel.newest;
-        channel.xr_last_sequence = channel.sequence;
+    const Frame frame{channel.newest, channel.generation, channel.slots[channel.newest].game_value, channel.width,
+                      channel.height, channel.format, channel.slots[channel.newest].meta, channel_index};
+    for (int i = 0; i < k_slots; ++i) {
+        handles[i] = channel.slots[i].handle;
     }
+    channel.claimed = channel.newest;
+    channel.xr_last_sequence = channel.sequence;
+    return frame;
+}
 
+bool has_new(const Channel& channel) {
+    return channel.newest >= 0 && channel.sequence != channel.xr_last_sequence;
+}
+
+// XR thread, after claiming: opens the fences and (re)opens the channel's textures.
+bool open_for_xr(const Frame& frame, const HANDLE (&handles)[k_slots], ID3D11Device* device) {
     if (g_fenced && !g_xr.fences_opened && !open_xr_fences(device)) {
         g_fenced = false; // the game side reads this before its next GPU wait
         g_description = "shared textures, flush only (fence open failed)";
     }
 
+    auto& channel = g_channels[frame.channel];
     if (frame.generation != channel.xr_generation) {
         for (auto& texture : channel.xr_textures) {
             release_com(texture);
@@ -272,14 +275,57 @@ std::optional<Frame> claim_newest(int channel_index, ID3D11Device* device) {
             if (FAILED(device->OpenSharedResource(handles[i], __uuidof(ID3D11Texture2D),
                                                   reinterpret_cast<void**>(&channel.xr_textures[i])))) {
                 logger::error("[transport] could not open shared texture %d on the XR device", i);
-                release(frame);
-                return std::nullopt;
+                return false;
             }
         }
         channel.xr_generation = frame.generation;
     }
+    return true;
+}
+} // namespace
 
+std::optional<Frame> claim_newest(int channel_index, ID3D11Device* device) {
+    Frame frame;
+    HANDLE handles[k_slots]{};
+    {
+        std::scoped_lock _{g_mutex};
+        const auto& channel = g_channels[channel_index];
+        // Halves of a stereo pair are only taken together (claim_pair).
+        if (!has_new(channel) || channel.slots[channel.newest].meta.paired) {
+            return std::nullopt;
+        }
+        frame = claim_locked(channel_index, handles);
+    }
+    if (!open_for_xr(frame, handles, device)) {
+        release(frame);
+        return std::nullopt;
+    }
     return frame;
+}
+
+bool claim_pair(ID3D11Device* device, Frame& left, Frame& right) {
+    HANDLE left_handles[k_slots]{}, right_handles[k_slots]{};
+    {
+        std::scoped_lock _{g_mutex};
+        const auto& l = g_channels[0];
+        const auto& r = g_channels[1];
+        if (l.newest < 0 || r.newest < 0 || (!has_new(l) && !has_new(r))) {
+            return false;
+        }
+        const auto& lm = l.slots[l.newest].meta;
+        const auto& rm = r.slots[r.newest].meta;
+        if (!lm.paired || !rm.paired || lm.sequence != rm.sequence) {
+            return false; // the other half of this game frame hasn't arrived yet
+        }
+        left = claim_locked(0, left_handles);
+        right = claim_locked(1, right_handles);
+    }
+    if (!open_for_xr(left, left_handles, device) || !open_for_xr(right, right_handles, device)) {
+        release(left);
+        release(right);
+        return false;
+    }
+    return true;
 }
 
 void copy_and_release(const Frame& frame, ID3D11DeviceContext* context, ID3D11Texture2D* destination) {

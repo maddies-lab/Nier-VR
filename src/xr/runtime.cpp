@@ -464,18 +464,13 @@ bool create_swapchain(EyeImage& eye, uint32_t width, uint32_t height, DXGI_FORMA
     return true;
 }
 
-// Copies the newest game frame into its eye's swapchain, if there is one.
-void consume_game_frame(int channel) {
-    const auto frame = transport::claim_newest(channel, g_xr_device);
-    if (!frame) {
-        return;
-    }
-
-    auto& eye = g_eye_images[frame->meta.eye == 1 ? 1 : 0];
-    if (eye.swapchain == XR_NULL_HANDLE || frame->width != eye.width || frame->height != eye.height ||
-        frame->format != eye.source_format) {
-        if (!create_swapchain(eye, frame->width, frame->height, frame->format)) {
-            transport::release(*frame);
+// Copies a claimed game frame into its eye's swapchain.
+void copy_to_eye(const transport::Frame& frame) {
+    auto& eye = g_eye_images[frame.meta.eye == 1 ? 1 : 0];
+    if (eye.swapchain == XR_NULL_HANDLE || frame.width != eye.width || frame.height != eye.height ||
+        frame.format != eye.source_format) {
+        if (!create_swapchain(eye, frame.width, frame.height, frame.format)) {
+            transport::release(frame);
             return;
         }
     }
@@ -485,19 +480,33 @@ void consume_game_frame(int channel) {
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wait.timeout = XR_INFINITE_DURATION;
     if (!check(fn::xrAcquireSwapchainImage(eye.swapchain, &acquire, &index), "xrAcquireSwapchainImage")) {
-        transport::release(*frame);
+        transport::release(frame);
         return;
     }
     if (!check(fn::xrWaitSwapchainImage(eye.swapchain, &wait), "xrWaitSwapchainImage")) {
-        transport::release(*frame);
+        transport::release(frame);
     } else {
-        transport::copy_and_release(*frame, g_xr_context, eye.images.at(index));
-        eye.meta = frame->meta;
+        transport::copy_and_release(frame, g_xr_context, eye.images.at(index));
+        eye.meta = frame.meta;
     }
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     if (check(fn::xrReleaseSwapchainImage(eye.swapchain, &release_info), "xrReleaseSwapchainImage")) {
         eye.ready = true;
+    }
+}
+
+// Takes the newest game frame(s): a complete both-eyes pair, or a single image
+// (theater, mono, alternate eyes, or a frame drawn for one eye only).
+void consume_game_frames() {
+    transport::Frame left, right;
+    if (transport::claim_pair(g_xr_device, left, right)) {
+        copy_to_eye(left);
+        copy_to_eye(right);
+        return;
+    }
+    if (const auto frame = transport::claim_newest(0, g_xr_device)) {
+        copy_to_eye(*frame);
     }
 }
 
@@ -627,8 +636,7 @@ void xr_thread() {
         }
 
         start = Clock::now();
-        consume_game_frame(0);
-        consume_game_frame(1);
+        consume_game_frames();
         copy_time.add(ms_since(start));
 
         if (g_recenter && frame.shouldRender) {
@@ -749,7 +757,10 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
         if (fresh) {
             g_last_secondary = candidate.secondary;
         }
-        ok = transport::publish(1, g_game_device, g_game_context, backbuffer, g_last_secondary);
+        transport::FrameMeta meta = g_last_secondary;
+        meta.paired = true;
+        meta.sequence = candidate.sequence;
+        ok = transport::publish(1, g_game_device, g_game_context, backbuffer, meta);
     } else {
         // A frame without its own pose reuses the last one (slightly stale, never a mode flip).
         const transport::FrameMeta meta =
@@ -1014,7 +1025,10 @@ bool job_views(JobViews& out) {
     return true;
 }
 
-bool publish_from_job(const transport::FrameMeta& meta) {
+bool publish_from_job(const transport::FrameMeta& job_meta, uint64_t sequence) {
+    transport::FrameMeta meta = job_meta;
+    meta.paired = true;
+    meta.sequence = sequence;
     ID3D11Texture2D* backbuffer = nullptr;
     if (g_game_swapchain == nullptr ||
         FAILED(g_game_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {

@@ -24,6 +24,8 @@ constexpr int k_channels = 2; // 0 = left eye / mono / theater, 1 = right eye
 struct FrameMeta {
     bool projected = false;                    // false: theater quad; true: projection layer
     int eye = -1;                              // -1 mono/theater, 0 left, 1 right
+    bool paired = false;                       // half of a both-eyes pair (see claim_pair)
+    uint64_t sequence = 0;                     // camera update the frame was rendered from
     float orientation[4]{0, 0, 0, 1};          // head pose the frame was rendered for (LOCAL space)
     float position[3]{};
     float tan_left = 0, tan_right = 0, tan_up = 0, tan_down = 0;
@@ -46,6 +48,10 @@ bool publish(int channel, ID3D11Device* device, ID3D11DeviceContext* context, ID
 
 // XR thread. Claims the channel's newest frame if it has not been consumed yet.
 std::optional<Frame> claim_newest(int channel, ID3D11Device* device);
+
+// XR thread. Claims a both-eyes pair: the newest left and right images, only when
+// both belong to the same game frame (so the eyes never see different moments).
+bool claim_pair(ID3D11Device* device, Frame& left, Frame& right);
 
 // XR thread. Copies a claimed frame into `destination` and releases the claim.
 void copy_and_release(const Frame& frame, ID3D11DeviceContext* context, ID3D11Texture2D* destination);

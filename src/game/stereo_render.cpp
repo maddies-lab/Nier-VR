@@ -197,7 +197,7 @@ void __fastcall draw_job_detour(void* device) {
     if (timing) {
         context->End(queries.stamps[1]);
     }
-    xr::publish_from_job(views.primary);
+    xr::publish_from_job(views.primary, views.sequence);
 
     // Right eye: same queue, the main camera's SceneBuffer re-uploaded.
     D3D11_MAPPED_SUBRESOURCE mapped{};
