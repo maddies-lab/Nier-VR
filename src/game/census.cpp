@@ -1,6 +1,7 @@
 #include "game/census.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -9,6 +10,7 @@
 
 #include <windows.h>
 
+#include "game/camera.hpp"
 #include "hooks/context_hook.hpp"
 #include "log.hpp"
 
@@ -30,12 +32,14 @@ std::mutex g_mutex;
 std::map<std::string, Path> g_paths;
 uint32_t g_calls = 0;
 
-// Camera-sized constant buffers mapped during the recording: their contents are
-// logged at Unmap (256 B = SceneBuffer candidates, 32 B = CamParam candidates).
+// Constant buffers mapped during the recording: scanned at Unmap for copies of the
+// main camera (both-eyes mode needs every camera-dependent upload re-done for the
+// right eye); 256 B / 32 B ones are also dumped.
 struct PendingMap {
     ID3D11Resource* resource = nullptr;
     const void* data = nullptr;
     UINT size = 0;
+    std::string path;
 };
 thread_local PendingMap t_pending;
 int g_dumps = 0;
@@ -83,13 +87,81 @@ void on_map(ID3D11Resource* resource, D3D11_MAP type, const D3D11_MAPPED_SUBRESO
     std::snprintf(kind, sizeof(kind), "Map[%s %u t%d]", dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? "buf" : "tex",
                   size, (int)type);
     record(kind);
-    if (SUCCEEDED(hr) && (size == 256 || size == 32)) {
-        t_pending = {resource, mapped->pData, size};
+    if (SUCCEEDED(hr) && dimension == D3D11_RESOURCE_DIMENSION_BUFFER && size >= 12 && size <= 65536) {
+        uintptr_t frames[6];
+        const auto count = logger::scan_return_addresses(frames, 6, 8192);
+        const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        std::string path;
+        for (size_t i = 0; i < count; ++i) {
+            char entry[16];
+            std::snprintf(entry, sizeof(entry), " %llx", (unsigned long long)(frames[i] - exe));
+            path += entry;
+        }
+        t_pending = {resource, mapped->pData, size, path};
+    }
+}
+
+bool near(float a, float b) {
+    return std::fabs(a - b) <= 1e-3f * std::fmax(1.0f, std::fabs(b));
+}
+
+// 16 floats at p equal matrix m (row-major as stored) or its transpose?
+const char* match_matrix(const float* p, const float* m) {
+    bool same = true, transposed = true;
+    for (int r = 0; r < 4 && (same || transposed); ++r) {
+        for (int c = 0; c < 4; ++c) {
+            same = same && near(p[r * 4 + c], m[r * 4 + c]);
+            transposed = transposed && near(p[r * 4 + c], m[c * 4 + r]);
+        }
+    }
+    return same ? "" : transposed ? " (transposed)" : nullptr;
+}
+
+int g_camera_hits = 0;
+
+void scan_for_camera(const PendingMap& pending) {
+    const auto camera = CameraGame::get();
+    if (camera == nullptr || camera->data() == nullptr || g_camera_hits >= 80) {
+        return;
+    }
+    const auto data = reinterpret_cast<const float*>(camera->data());
+    struct Candidate {
+        const char* name;
+        const float* value;
+    };
+    const Candidate matrices[] = {{"view", data + 0x00 / 4},
+                                  {"projection", data + 0x40 / 4},
+                                  {"view*projection", data + 0x80 / 4},
+                                  {"camera-to-world", data + 0xC0 / 4},
+                                  {"previous view*projection", data + 0x200 / 4}};
+    const float* position = data + 0xF0 / 4; // camera-to-world origin = eye position
+    const auto f = static_cast<const float*>(pending.data);
+    const UINT count = pending.size / 4;
+    for (UINT i = 0; i + 3 <= count; ++i) {
+        for (const auto& candidate : matrices) {
+            if (i + 16 <= count) {
+                if (const char* how = match_matrix(f + i, candidate.value)) {
+                    logger::info("[census] camera data: %u-byte buffer %p +0x%x = %s%s  (path%s)", pending.size,
+                                 (void*)pending.resource, i * 4, candidate.name, how, pending.path.c_str());
+                    ++g_camera_hits;
+                }
+            }
+        }
+        if (near(f[i], position[0]) && near(f[i + 1], position[1]) && near(f[i + 2], position[2]) &&
+            std::fabs(position[0]) + std::fabs(position[1]) + std::fabs(position[2]) > 1.0f) {
+            logger::info("[census] camera data: %u-byte buffer %p +0x%x = camera position  (path%s)", pending.size,
+                         (void*)pending.resource, i * 4, pending.path.c_str());
+            ++g_camera_hits;
+        }
     }
 }
 
 void on_unmap(ID3D11Resource* resource) {
-    if (g_state == State::recording && t_pending.resource == resource && g_dumps < 24) {
+    if (g_state == State::recording && t_pending.resource == resource) {
+        scan_for_camera(t_pending);
+    }
+    if (g_state == State::recording && t_pending.resource == resource && g_dumps < 24 &&
+        (t_pending.size == 256 || t_pending.size == 32)) {
         ++g_dumps;
         const auto f = static_cast<const float*>(t_pending.data);
         logger::info("[census] %u-byte buffer %p contents:", t_pending.size, (void*)resource);
@@ -117,6 +189,7 @@ void report() {
     }
     g_calls = 0;
     g_dumps = 0;
+    g_camera_hits = 0;
 }
 } // namespace
 
