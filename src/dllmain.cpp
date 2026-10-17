@@ -1,13 +1,17 @@
+#include <string>
+
 #include <windows.h>
 
 #include <MinHook.h>
 
 #include "game/build.hpp"
 #include "game/camera.hpp"
+#include "game/dump.hpp"
 #include "hooks/d3d11_hook.hpp"
 #include "log.hpp"
 #include "overlay.hpp"
 #include "proxy/proxy.hpp"
+#include "xr/runtime.hpp"
 
 namespace {
 constexpr uint32_t k_camera_timeout_ms = 120'000;
@@ -32,8 +36,23 @@ DWORD WINAPI init_thread(LPVOID) {
         return 1;
     }
 
+    // NIERVR_DUMP=1 writes the decrypted executable next to the game for static analysis.
+    wchar_t dump_flag[8]{};
+    if (GetEnvironmentVariableW(L"NIERVR_DUMP", dump_flag, 8) > 0 && dump_flag[0] == L'1') {
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        std::wstring out{path};
+        out = out.substr(0, out.find_last_of(L"\\/") + 1) + L"NieRAutomata.decrypted.exe";
+        game::dump_executable(out);
+    }
+
     hooks::install_d3d11({
-        .on_present = overlay::on_present,
+        // The overlay draws first so it is visible on the virtual screen too.
+        .on_present =
+            [](IDXGISwapChain* swapchain) {
+                overlay::on_present(swapchain);
+                xr::on_present(swapchain);
+            },
         .on_pre_resize = overlay::on_pre_resize,
     });
     return 0;

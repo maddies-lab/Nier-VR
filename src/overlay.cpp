@@ -7,6 +7,7 @@
 #include "game/build.hpp"
 #include "game/camera.hpp"
 #include "log.hpp"
+#include "xr/runtime.hpp"
 
 namespace overlay {
 namespace {
@@ -72,13 +73,29 @@ void draw_window(IDXGISwapChain* swapchain) {
 
     ImGui::SetNextWindowPos(ImVec2{16, 16}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
-    ImGui::Begin("NieR-VR  M0", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("Insert: toggle overlay");
+    ImGui::Begin("NieR-VR  M1", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::Text("Insert: toggle overlay   F8: recenter screen");
     ImGui::Separator();
     ImGui::Text("Build: %s (stamp 0x%08X)", g_build.name != nullptr ? g_build.name : "UNKNOWN", g_build.timestamp);
     ImGui::Text("Backbuffer: %u x %u, format %d, frame %llu", desc.BufferDesc.Width, desc.BufferDesc.Height,
                 (int)desc.BufferDesc.Format, (unsigned long long)g_frame);
     ImGui::Text("Frame time: %.2f ms", ImGui::GetIO().DeltaTime * 1000.0f);
+    ImGui::Separator();
+
+    const auto vr = xr::status();
+    ImGui::Text("OpenXR: %s", vr.state);
+    if (!vr.runtime.empty()) {
+        ImGui::Text("  runtime %s, headset %s", vr.runtime.c_str(), vr.system.empty() ? "-" : vr.system.c_str());
+    }
+    ImGui::Text("  transport: %s, screen %ux%u", vr.transport, vr.width, vr.height);
+    ImGui::Text("  headset %5.1f fps  wait %5.2f/%5.2f  begin %4.2f/%4.2f  copy %4.2f/%4.2f  end %5.2f/%5.2f ms",
+                vr.headset_fps, vr.xr_wait.avg_ms, vr.xr_wait.max_ms, vr.xr_begin.avg_ms, vr.xr_begin.max_ms,
+                vr.xr_copy.avg_ms, vr.xr_copy.max_ms, vr.xr_end.avg_ms, vr.xr_end.max_ms);
+    ImGui::Text("  game    %5.1f fps  dropped %4.1f fps  copy %4.2f/%4.2f ms (avg/max)", vr.game_fps,
+                vr.dropped_fps, vr.game_copy.avg_ms, vr.game_copy.max_ms);
+    if (!vr.last_error.empty()) {
+        ImGui::TextColored(ImVec4{1, 0.3f, 0.3f, 1}, "  %s", vr.last_error.c_str());
+    }
     ImGui::Separator();
 
     const auto camera = game::CameraGame::get();

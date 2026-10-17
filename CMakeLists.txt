@@ -16,7 +16,12 @@ FetchContent_Declare(minhook
     SOURCE_SUBDIR _unused)
 FetchContent_Declare(imgui
     URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9.tar.gz)
-FetchContent_MakeAvailable(minhook imgui)
+# Khronos Windows loader: headers to build against, openxr_loader.dll to ship.
+FetchContent_Declare(openxr_loader
+    URL https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip
+    URL_HASH SHA256=800ec772e2f9448a26ab9f579f4914d984346dd9d0d7c007841abe21d2c8ff2f
+    SOURCE_SUBDIR _unused)
+FetchContent_MakeAvailable(minhook imgui openxr_loader)
 
 add_library(minhook STATIC
     ${minhook_SOURCE_DIR}/src/buffer.c
@@ -43,15 +48,22 @@ add_library(nier_vr SHARED
     src/overlay.cpp
     src/game/build.cpp
     src/game/camera.cpp
+    src/game/dump.cpp
     src/hooks/d3d11_hook.cpp
     src/proxy/proxy.cpp
+    src/xr/runtime.cpp
     ${PROXY_DIR}/${NIER_VR_PROXY}_table.cpp
     ${PROXY_DIR}/${NIER_VR_PROXY}_stubs.S
     ${PROXY_DIR}/${NIER_VR_PROXY}.def)
-target_include_directories(nier_vr PRIVATE src)
+target_include_directories(nier_vr PRIVATE src ${openxr_loader_SOURCE_DIR}/include)
 target_link_libraries(nier_vr PRIVATE minhook imgui d3d11 dxgi)
 target_compile_definitions(nier_vr PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-target_compile_options(nier_vr PRIVATE -Wall -Wextra -Wno-unused-parameter)
+# OpenXR structs are initialised as {XR_TYPE_...}; loader entry points come from GetProcAddress.
+target_compile_options(nier_vr PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type)
 # Self-contained DLL: no libgcc/libstdc++/winpthread DLLs to ship.
 target_link_options(nier_vr PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup)
 set_target_properties(nier_vr PROPERTIES PREFIX "" OUTPUT_NAME ${NIER_VR_PROXY})
+
+add_custom_command(TARGET nier_vr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${openxr_loader_SOURCE_DIR}/x64/bin/openxr_loader.dll $<TARGET_FILE_DIR:nier_vr>/openxr_loader.dll)
