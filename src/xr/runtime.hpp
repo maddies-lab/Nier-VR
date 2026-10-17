@@ -24,7 +24,7 @@ struct Status {
     // Rolling one-second windows.
     float headset_fps = 0;       // xrEndFrame calls
     float game_fps = 0;          // game frames handed to the XR device
-    float dropped_fps = 0;       // game frames skipped because the XR thread still held the last one
+    float dropped_fps = 0;       // game frames that could not be handed over (errors only)
     Timing xr_wait, xr_begin, xr_copy, xr_end; // XR thread
     Timing game_copy;                          // render thread: backbuffer -> shared texture
 };

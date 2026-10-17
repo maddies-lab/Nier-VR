@@ -51,6 +51,7 @@ add_library(nier_vr SHARED
     src/game/dump.cpp
     src/hooks/d3d11_hook.cpp
     src/proxy/proxy.cpp
+    src/xr/frame_transport.cpp
     src/xr/runtime.cpp
     ${PROXY_DIR}/${NIER_VR_PROXY}_table.cpp
     ${PROXY_DIR}/${NIER_VR_PROXY}_stubs.S

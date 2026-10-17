@@ -7,7 +7,7 @@ proxy, waits for SteamStub to decrypt the game, finds `cCameraGame` (validated a
 its RTTI vftable) and draws a debug overlay with the live camera (Insert toggles it).
 With an OpenXR runtime running, the game is shown on a virtual screen in the headset
 (F8 recenters it). The headset runs on its own D3D11 device and thread; frames cross
-over through a keyed-mutex shared texture (see `src/xr/runtime.cpp`).
+over through shared textures and GPU-side shared fences (see `src/xr/frame_transport.hpp`).
 
 Set `NIERVR_DUMP=1` to write the SteamStub-decrypted executable next to the game for
 static analysis (Ghidra/IDA). Do not distribute it.

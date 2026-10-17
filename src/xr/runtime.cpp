@@ -12,14 +12,14 @@
 #include <vector>
 
 #include "log.hpp"
+#include "xr/frame_transport.hpp"
 #include "xr/openxr.hpp"
 
 // Two D3D11 devices, two threads:
-//   render thread (game's Present, game device) - copies the backbuffer into a
-//       texture shared with the XR device. Never waits: if the XR thread still
-//       holds the previous frame, this frame is dropped.
+//   render thread (game's Present, game device) - hands each backbuffer to the
+//       XR device through xr::transport (shared textures + GPU-side fences).
 //   XR thread (own device) - OpenXR instance/session, events and the headset
-//       frame loop; copies the shared texture into the swapchain.
+//       frame loop; copies the newest game frame into the swapchain.
 // The session uses its own device because wineopenxr holds the session device's
 // DXVK submission queue lock for the whole native xrEndFrame (about one display
 // period on WiVRn), which starved the game's own GPU submissions when it was
@@ -70,24 +70,9 @@ std::atomic<bool> g_started{false};
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_recenter{true};
 
-// The shared texture as published by the render thread to the XR thread.
-struct ShareInfo {
-    HANDLE handle = nullptr;
-    uint32_t width = 0, height = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    bool keyed = false;      // IDXGIKeyedMutex hand-off; otherwise flush + sequence number
-    uint64_t generation = 0; // bumped whenever the texture is recreated
-};
-std::mutex g_share_mutex;
-ShareInfo g_share;
-std::atomic<uint64_t> g_frame_sequence{0}; // unkeyed mode: bumped after each game copy
-
 // Render thread only.
 ID3D11Device* g_game_device = nullptr;
 ID3D11DeviceContext* g_game_context = nullptr;
-ID3D11Texture2D* g_game_texture = nullptr;
-IDXGIKeyedMutex* g_game_mutex = nullptr;
-D3D11_TEXTURE2D_DESC g_game_texture_desc{};
 bool g_recenter_key_was_down = false;
 Accumulator g_game_copy_time;
 uint32_t g_game_frames = 0, g_dropped_frames = 0;
@@ -96,10 +81,6 @@ Clock::time_point g_game_window_start = Clock::now();
 // XR thread only.
 ID3D11Device* g_xr_device = nullptr;
 ID3D11DeviceContext* g_xr_context = nullptr;
-ID3D11Texture2D* g_xr_texture = nullptr;
-IDXGIKeyedMutex* g_xr_mutex = nullptr;
-ShareInfo g_xr_share;
-uint64_t g_xr_last_sequence = 0;
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system = XR_NULL_SYSTEM_ID;
 XrSession g_session = XR_NULL_HANDLE;
@@ -107,6 +88,8 @@ XrSpace g_local = XR_NULL_HANDLE;
 XrSpace g_view = XR_NULL_HANDLE;
 XrSwapchain g_swapchain = XR_NULL_HANDLE;
 std::vector<ID3D11Texture2D*> g_images;
+uint32_t g_swapchain_width = 0, g_swapchain_height = 0;
+DXGI_FORMAT g_swapchain_source_format = DXGI_FORMAT_UNKNOWN;
 bool g_image_ready = false; // the swapchain holds at least one released game frame
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
 
@@ -408,74 +391,50 @@ bool create_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT source_format
         g_images.push_back(image.texture);
     }
 
+    g_swapchain_width = width;
+    g_swapchain_height = height;
+    g_swapchain_source_format = source_format;
+    {
+        std::scoped_lock _{g_status_mutex};
+        g_status.width = width;
+        g_status.height = height;
+    }
     logger::info("[xr] swapchain %ux%u, format %lld, %u images", width, height, (long long)chosen, count);
     return true;
 }
 
-// Picks up a recreated shared texture: reopens it on the XR device and resizes the swapchain.
-void sync_shared_texture() {
-    ShareInfo share;
-    {
-        std::scoped_lock _{g_share_mutex};
-        share = g_share;
-    }
-    if (share.generation == g_xr_share.generation) {
+// Copies the newest game frame into the swapchain, if there is one.
+void consume_game_frame() {
+    const auto frame = transport::claim_newest(g_xr_device);
+    if (!frame) {
         return;
     }
 
-    release(g_xr_mutex);
-    release(g_xr_texture);
-    g_xr_share = share;
-    g_xr_last_sequence = 0;
-
-    if (FAILED(g_xr_device->OpenSharedResource(share.handle, __uuidof(ID3D11Texture2D),
-                                               reinterpret_cast<void**>(&g_xr_texture)))) {
-        set_error("OpenSharedResource on the XR device failed");
-        return;
+    if (g_swapchain == XR_NULL_HANDLE || frame->width != g_swapchain_width || frame->height != g_swapchain_height ||
+        frame->format != g_swapchain_source_format) {
+        if (!create_swapchain(frame->width, frame->height, frame->format)) {
+            transport::release(*frame);
+            return;
+        }
     }
-    if (share.keyed) {
-        g_xr_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&g_xr_mutex));
-    }
-    create_swapchain(share.width, share.height, share.format);
-}
 
-void copy_to_swapchain() {
     uint32_t index = 0;
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wait.timeout = XR_INFINITE_DURATION;
-    if (!check(fn::xrAcquireSwapchainImage(g_swapchain, &acquire, &index), "xrAcquireSwapchainImage") ||
-        !check(fn::xrWaitSwapchainImage(g_swapchain, &wait), "xrWaitSwapchainImage")) {
+    if (!check(fn::xrAcquireSwapchainImage(g_swapchain, &acquire, &index), "xrAcquireSwapchainImage")) {
+        transport::release(*frame);
         return;
     }
-
-    g_xr_context->CopyResource(g_images.at(index), g_xr_texture);
+    if (!check(fn::xrWaitSwapchainImage(g_swapchain, &wait), "xrWaitSwapchainImage")) {
+        transport::release(*frame);
+    } else {
+        transport::copy_and_release(*frame, g_xr_context, g_images.at(index));
+    }
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     if (check(fn::xrReleaseSwapchainImage(g_swapchain, &release_info), "xrReleaseSwapchainImage")) {
         g_image_ready = true;
-    }
-}
-
-// Copies the newest game frame into the swapchain, if there is one.
-void consume_game_frame() {
-    if (g_xr_texture == nullptr || g_swapchain == XR_NULL_HANDLE) {
-        return;
-    }
-
-    if (g_xr_mutex != nullptr) {
-        if (g_xr_mutex->AcquireSync(1, 0) != S_OK) {
-            return; // no new frame since the last one
-        }
-        copy_to_swapchain();
-        g_xr_mutex->ReleaseSync(0);
-        return;
-    }
-
-    const auto sequence = g_frame_sequence.load();
-    if (sequence != g_xr_last_sequence) {
-        g_xr_last_sequence = sequence;
-        copy_to_swapchain();
     }
 }
 
@@ -562,7 +521,6 @@ void xr_thread() {
         }
 
         start = Clock::now();
-        sync_shared_texture();
         consume_game_frame();
         copy_time.add(ms_since(start));
 
@@ -579,9 +537,9 @@ void xr_thread() {
             quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain = g_swapchain;
             quad.subImage.imageRect = {
-                {0, 0}, {static_cast<int32_t>(g_xr_share.width), static_cast<int32_t>(g_xr_share.height)}};
+                {0, 0}, {static_cast<int32_t>(g_swapchain_width), static_cast<int32_t>(g_swapchain_height)}};
             quad.pose = g_screen_pose;
-            quad.size = {k_screen_width, k_screen_width * g_xr_share.height / g_xr_share.width};
+            quad.size = {k_screen_width, k_screen_width * g_swapchain_height / g_swapchain_width};
             layer_count = 1;
         }
 
@@ -602,99 +560,15 @@ void xr_thread() {
 // ---------------------------------------------------------------------------
 // Render thread
 
-// (Re)creates the texture shared with the XR device to match the backbuffer.
-bool ensure_game_texture(const D3D11_TEXTURE2D_DESC& backbuffer) {
-    if (g_game_texture != nullptr && g_game_texture_desc.Width == backbuffer.Width &&
-        g_game_texture_desc.Height == backbuffer.Height && g_game_texture_desc.Format == backbuffer.Format) {
-        return true;
-    }
-    release(g_game_mutex);
-    release(g_game_texture);
-
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = backbuffer.Width;
-    desc.Height = backbuffer.Height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = backbuffer.Format;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-
-    bool keyed = SUCCEEDED(g_game_device->CreateTexture2D(&desc, nullptr, &g_game_texture));
-    if (!keyed) {
-        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-        if (FAILED(g_game_device->CreateTexture2D(&desc, nullptr, &g_game_texture))) {
-            set_error("could not create a shared texture on the game device");
-            return false;
-        }
-    }
-
-    IDXGIResource* resource = nullptr;
-    HANDLE handle = nullptr;
-    if (FAILED(g_game_texture->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void**>(&resource))) ||
-        FAILED(resource->GetSharedHandle(&handle)) || handle == nullptr) {
-        release(resource);
-        release(g_game_texture);
-        set_error("could not get the shared texture's handle");
-        return false;
-    }
-    release(resource);
-
-    if (keyed && FAILED(g_game_texture->QueryInterface(__uuidof(IDXGIKeyedMutex),
-                                                       reinterpret_cast<void**>(&g_game_mutex)))) {
-        keyed = false;
-    }
-    g_game_texture_desc = desc;
-
-    {
-        std::scoped_lock _{g_share_mutex};
-        g_share = {handle, desc.Width, desc.Height, desc.Format, keyed, g_share.generation + 1};
-    }
-    {
-        std::scoped_lock _{g_status_mutex};
-        g_status.transport = keyed ? "shared texture, keyed mutex" : "shared texture, flush only";
-        g_status.width = desc.Width;
-        g_status.height = desc.Height;
-    }
-    logger::info("[xr] shared texture %ux%u format %d (%s)", desc.Width, desc.Height, (int)desc.Format,
-                 keyed ? "keyed mutex" : "no keyed mutex");
-    return true;
-}
-
-// Returns true if the frame was handed over, false if dropped.
+// Returns true if the frame was handed to the XR device.
 bool hand_over_frame(IDXGISwapChain* swapchain) {
     ID3D11Texture2D* backbuffer = nullptr;
     if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
         return false;
     }
-
-    D3D11_TEXTURE2D_DESC desc{};
-    backbuffer->GetDesc(&desc);
-    bool handed_over = false;
-
-    if (ensure_game_texture(desc)) {
-        // Key 0: the game may write. Key 1: the XR thread may read. Never wait here.
-        if (g_game_mutex == nullptr || g_game_mutex->AcquireSync(0, 0) == S_OK) {
-            if (desc.SampleDesc.Count > 1) {
-                g_game_context->ResolveSubresource(g_game_texture, 0, backbuffer, 0, desc.Format);
-            } else {
-                g_game_context->CopyResource(g_game_texture, backbuffer);
-            }
-
-            if (g_game_mutex != nullptr) {
-                g_game_mutex->ReleaseSync(1);
-            } else {
-                g_game_context->Flush();
-                ++g_frame_sequence;
-            }
-            handed_over = true;
-        }
-    }
-
+    const bool ok = transport::publish(g_game_device, g_game_context, backbuffer);
     backbuffer->Release();
-    return handed_over;
+    return ok;
 }
 } // namespace
 
@@ -731,6 +605,7 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.game_fps = static_cast<float>(g_game_frames * 1000.0 / elapsed);
         g_status.dropped_fps = static_cast<float>(g_dropped_frames * 1000.0 / elapsed);
         g_status.game_copy = g_game_copy_time.take();
+        g_status.transport = transport::description();
         g_game_frames = 0;
         g_dropped_frames = 0;
         g_game_window_start = Clock::now();
