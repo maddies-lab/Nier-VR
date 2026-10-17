@@ -89,6 +89,9 @@ void draw_window(IDXGISwapChain* swapchain) {
     const auto vr = xr::status();
     ImGui::Text("OpenXR: %s   mode: %s%s", vr.state, vr.head_tracking ? "head tracking (mono)" : "theater",
                 vr.head_tracking && !vr.projected ? " - waiting for camera" : "");
+    if (vr.head_tracking) {
+        ImGui::Text("  F6 pose pairing: %s", vr.pairing ? "previous Present (pipelined)" : "newest");
+    }
     if (!vr.runtime.empty()) {
         ImGui::Text("  runtime %s, headset %s", vr.runtime.c_str(), vr.system.empty() ? "-" : vr.system.c_str());
     }

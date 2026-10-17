@@ -108,7 +108,17 @@ std::atomic<bool> g_head_tracking{false};
 // The view rendered this frame (game threads), sent with the frame at Present.
 std::mutex g_frame_meta_mutex;
 transport::FrameMeta g_frame_meta;
-bool g_frame_meta_valid = false;
+uint64_t g_frame_meta_sequence = 0; // bumped per camera update
+
+// Render thread: which pose goes with a presented image. The camera update runs
+// on the game's update thread a few ms after each Present, while the render thread
+// draws with the camera from the update before; so by default the pose latched at
+// the previous Present goes with this one (F6 switches to "newest").
+std::atomic<int> g_pairing{1}; // 0 = newest pose, 1 = pose latched at the previous Present
+transport::FrameMeta g_latched_meta;
+uint64_t g_latched_sequence = 0;
+uint64_t g_used_sequence = 0;
+bool g_pairing_key_was_down = false;
 bool g_head_tracking_key_was_down = false; // render thread only
 
 // Render thread: hysteresis between theater and projected presentation, so screens
@@ -650,13 +660,27 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
     if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
         return false;
     }
-    std::optional<transport::FrameMeta> fresh;
+    transport::FrameMeta newest;
+    uint64_t newest_sequence;
     {
         std::scoped_lock _{g_frame_meta_mutex};
-        if (g_frame_meta_valid) {
-            fresh = g_frame_meta;
-            g_frame_meta_valid = false;
-        }
+        newest = g_frame_meta;
+        newest_sequence = g_frame_meta_sequence;
+    }
+
+    transport::FrameMeta candidate = newest;
+    uint64_t candidate_sequence = newest_sequence;
+    if (g_pairing == 1) {
+        candidate = g_latched_meta;
+        candidate_sequence = g_latched_sequence;
+        g_latched_meta = newest;
+        g_latched_sequence = newest_sequence;
+    }
+
+    std::optional<transport::FrameMeta> fresh;
+    if (candidate_sequence != 0 && candidate_sequence != g_used_sequence) {
+        fresh = candidate;
+        g_used_sequence = candidate_sequence;
     }
 
     if (fresh) {
@@ -708,6 +732,13 @@ void on_present(IDXGISwapChain* swapchain) {
     }
     g_head_tracking_key_was_down = head_tracking_down;
 
+    const bool pairing_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (pairing_down && !g_pairing_key_was_down) {
+        g_pairing = 1 - g_pairing;
+        logger::info("[xr] pose pairing: %s", g_pairing ? "previous Present (pipelined)" : "newest");
+    }
+    g_pairing_key_was_down = pairing_down;
+
     trace("present");
 
     if (g_running) {
@@ -727,6 +758,7 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.game_copy = g_game_copy_time.take();
         g_status.transport = transport::description();
         g_status.head_tracking = g_head_tracking;
+        g_status.pairing = g_pairing;
         g_game_frames = 0;
         g_dropped_frames = 0;
         g_game_window_start = Clock::now();
@@ -818,7 +850,7 @@ bool begin_render_view(float aspect, RenderView& view) {
     meta.tan_down = down;
     std::scoped_lock _{g_frame_meta_mutex};
     g_frame_meta = meta;
-    g_frame_meta_valid = true;
+    ++g_frame_meta_sequence;
     return true;
 }
 
