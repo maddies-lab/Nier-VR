@@ -101,7 +101,7 @@ void on_map(ID3D11Resource* resource, D3D11_MAP type, const D3D11_MAPPED_SUBRESO
     }
 }
 
-bool near(float a, float b) {
+bool close_to(float a, float b) {
     return std::fabs(a - b) <= 1e-3f * std::fmax(1.0f, std::fabs(b));
 }
 
@@ -110,8 +110,8 @@ const char* match_matrix(const float* p, const float* m) {
     bool same = true, transposed = true;
     for (int r = 0; r < 4 && (same || transposed); ++r) {
         for (int c = 0; c < 4; ++c) {
-            same = same && near(p[r * 4 + c], m[r * 4 + c]);
-            transposed = transposed && near(p[r * 4 + c], m[c * 4 + r]);
+            same = same && close_to(p[r * 4 + c], m[r * 4 + c]);
+            transposed = transposed && close_to(p[r * 4 + c], m[c * 4 + r]);
         }
     }
     return same ? "" : transposed ? " (transposed)" : nullptr;
@@ -147,7 +147,7 @@ void scan_for_camera(const PendingMap& pending) {
                 }
             }
         }
-        if (near(f[i], position[0]) && near(f[i + 1], position[1]) && near(f[i + 2], position[2]) &&
+        if (close_to(f[i], position[0]) && close_to(f[i + 1], position[1]) && close_to(f[i + 2], position[2]) &&
             std::fabs(position[0]) + std::fabs(position[1]) + std::fabs(position[2]) > 1.0f) {
             logger::info("[census] camera data: %u-byte buffer %p +0x%x = camera position  (path%s)", pending.size,
                          (void*)pending.resource, i * 4, pending.path.c_str());
