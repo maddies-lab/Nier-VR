@@ -35,6 +35,8 @@ struct Status {
     float headset_fps = 0;       // xrEndFrame calls
     float game_fps = 0;          // game frames handed to the XR device
     float dropped_fps = 0;       // game frames that could not be handed over (errors only)
+    float pairs_per_second = 0;  // both-eyes pairs taken by the XR side
+    float singles_per_second = 0;
     Timing xr_wait, xr_begin, xr_copy, xr_end; // XR thread
     Timing game_copy;                          // render thread: backbuffer -> shared texture
 };

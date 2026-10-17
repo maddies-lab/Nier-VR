@@ -214,6 +214,8 @@ bool publish(int channel_index, ID3D11Device* device, ID3D11DeviceContext* conte
             }
         }
         read_done = channel.slots[slot].xr_value;
+        // Being rewritten: claim_pair must not match its old contents.
+        channel.slots[slot].meta = {};
     }
 
     const bool fenced = g_fenced;
@@ -242,15 +244,15 @@ bool publish(int channel_index, ID3D11Device* device, ID3D11DeviceContext* conte
 }
 
 namespace {
-// Caller holds g_mutex. Marks the channel's newest frame claimed and describes it.
-Frame claim_locked(int channel_index, HANDLE (&handles)[k_slots]) {
+// Caller holds g_mutex. Marks a slot of the channel claimed and describes it.
+Frame claim_locked(int channel_index, int slot, HANDLE (&handles)[k_slots]) {
     auto& channel = g_channels[channel_index];
-    const Frame frame{channel.newest, channel.generation, channel.slots[channel.newest].game_value, channel.width,
-                      channel.height, channel.format, channel.slots[channel.newest].meta, channel_index};
+    const Frame frame{slot, channel.generation, channel.slots[slot].game_value, channel.width,
+                      channel.height, channel.format, channel.slots[slot].meta, channel_index};
     for (int i = 0; i < k_slots; ++i) {
         handles[i] = channel.slots[i].handle;
     }
-    channel.claimed = channel.newest;
+    channel.claimed = slot;
     channel.xr_last_sequence = channel.sequence;
     return frame;
 }
@@ -294,7 +296,7 @@ std::optional<Frame> claim_newest(int channel_index, ID3D11Device* device) {
         if (!has_new(channel) || channel.slots[channel.newest].meta.paired) {
             return std::nullopt;
         }
-        frame = claim_locked(channel_index, handles);
+        frame = claim_locked(channel_index, channel.newest, handles);
     }
     if (!open_for_xr(frame, handles, device)) {
         release(frame);
@@ -307,18 +309,28 @@ bool claim_pair(ID3D11Device* device, Frame& left, Frame& right) {
     HANDLE left_handles[k_slots]{}, right_handles[k_slots]{};
     {
         std::scoped_lock _{g_mutex};
-        const auto& l = g_channels[0];
+        // The right image is published last (at Present), so a new right image is
+        // what completes a pair. Its left half was published earlier from the draw
+        // job and may no longer be the left channel's newest: the next frame's left
+        // image often follows within a few ms.
         const auto& r = g_channels[1];
-        if (l.newest < 0 || r.newest < 0 || (!has_new(l) && !has_new(r))) {
+        if (!has_new(r) || !r.slots[r.newest].meta.paired) {
             return false;
         }
-        const auto& lm = l.slots[l.newest].meta;
-        const auto& rm = r.slots[r.newest].meta;
-        if (!lm.paired || !rm.paired || lm.sequence != rm.sequence) {
-            return false; // the other half of this game frame hasn't arrived yet
+        const uint64_t sequence = r.slots[r.newest].meta.sequence;
+        const auto& l = g_channels[0];
+        int left_slot = -1;
+        for (int i = 0; i < k_slots; ++i) {
+            const auto& meta = l.slots[i].meta;
+            if (meta.paired && meta.sequence == sequence && l.slots[i].game_value != 0) {
+                left_slot = i;
+            }
         }
-        left = claim_locked(0, left_handles);
-        right = claim_locked(1, right_handles);
+        if (left_slot < 0) {
+            return false; // its left half was overwritten or never published
+        }
+        left = claim_locked(0, left_slot, left_handles);
+        right = claim_locked(1, r.newest, right_handles);
     }
     if (!open_for_xr(left, left_handles, device) || !open_for_xr(right, right_handles, device)) {
         release(left);
@@ -356,6 +368,16 @@ void release(const Frame& frame) {
     if (frame.generation == channel.generation && channel.claimed == frame.slot) {
         channel.claimed = -1;
     }
+}
+
+NewestInfo newest_info(int channel_index) {
+    std::scoped_lock _{g_mutex};
+    const auto& channel = g_channels[channel_index];
+    if (channel.newest < 0) {
+        return {};
+    }
+    const auto& meta = channel.slots[channel.newest].meta;
+    return {meta.sequence, meta.paired, has_new(channel)};
 }
 
 const char* description() {

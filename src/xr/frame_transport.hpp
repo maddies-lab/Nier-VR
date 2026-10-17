@@ -53,6 +53,15 @@ std::optional<Frame> claim_newest(int channel, ID3D11Device* device);
 // both belong to the same game frame (so the eyes never see different moments).
 bool claim_pair(ID3D11Device* device, Frame& left, Frame& right);
 
+// Diagnostics: sequences of each channel's newest frame (0 if none) and whether
+// it is half of a pair.
+struct NewestInfo {
+    uint64_t sequence = 0;
+    bool paired = false;
+    bool fresh = false; // not yet taken by the XR side
+};
+NewestInfo newest_info(int channel);
+
 // XR thread. Copies a claimed frame into `destination` and releases the claim.
 void copy_and_release(const Frame& frame, ID3D11DeviceContext* context, ID3D11Texture2D* destination);
 

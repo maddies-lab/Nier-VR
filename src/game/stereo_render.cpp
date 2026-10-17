@@ -84,12 +84,13 @@ struct PassTimes {
     uint32_t gpu_samples = 0;
 };
 PassTimes g_left, g_right;
+double g_handoff_gpu_ms = 0; // left image copy to the headset (includes waiting on the XR side's fence)
 uint32_t g_timed_frames = 0;
 
 constexpr int k_query_ring = 4;
 struct GpuQueries {
     ID3D11Query* disjoint = nullptr;
-    ID3D11Query* stamps[3]{}; // start, after left, after right
+    ID3D11Query* stamps[4]{}; // start, after left, after the left hand-off, after right
     bool pending = false;
 };
 GpuQueries g_queries[k_query_ring];
@@ -130,12 +131,12 @@ void collect_gpu_times(ID3D11DeviceContext* context) {
             continue;
         }
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
-        UINT64 stamps[3]{};
+        UINT64 stamps[4]{};
         if (context->GetData(q.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
             continue;
         }
         bool ready = true;
-        for (int i = 0; i < 3 && ready; ++i) {
+        for (int i = 0; i < 4 && ready; ++i) {
             ready = context->GetData(q.stamps[i], &stamps[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
         }
         if (!ready) {
@@ -144,7 +145,8 @@ void collect_gpu_times(ID3D11DeviceContext* context) {
         q.pending = false;
         if (!disjoint.Disjoint && disjoint.Frequency != 0) {
             g_left.gpu_ms += (stamps[1] - stamps[0]) * 1000.0 / disjoint.Frequency;
-            g_right.gpu_ms += (stamps[2] - stamps[1]) * 1000.0 / disjoint.Frequency;
+            g_handoff_gpu_ms += (stamps[2] - stamps[1]) * 1000.0 / disjoint.Frequency;
+            g_right.gpu_ms += (stamps[3] - stamps[2]) * 1000.0 / disjoint.Frequency;
             ++g_left.gpu_samples;
             ++g_right.gpu_samples;
         }
@@ -156,11 +158,13 @@ void report_times() {
         return;
     }
     const auto avg = [](double total, uint32_t n) { return n > 0 ? total / n : 0.0; };
-    logger::info("[stereo] per frame: left eye cpu %.2f ms (read-back wait %.2f) gpu %.2f ms | right eye cpu %.2f ms "
-                 "(read-back wait %.2f) gpu %.2f ms",
-                 g_left.cpu_ms / g_timed_frames, g_left.read_wait_ms / g_timed_frames,
-                 avg(g_left.gpu_ms, g_left.gpu_samples), g_right.cpu_ms / g_timed_frames,
-                 g_right.read_wait_ms / g_timed_frames, avg(g_right.gpu_ms, g_right.gpu_samples));
+    logger::info("[stereo] per frame: left eye cpu %.2f ms gpu %.2f ms | left hand-off gpu %.2f ms | right eye cpu "
+                 "%.2f ms gpu %.2f ms (read-back waits %.2f / %.2f ms)",
+                 g_left.cpu_ms / g_timed_frames, avg(g_left.gpu_ms, g_left.gpu_samples),
+                 avg(g_handoff_gpu_ms, g_left.gpu_samples), g_right.cpu_ms / g_timed_frames,
+                 avg(g_right.gpu_ms, g_right.gpu_samples), g_left.read_wait_ms / g_timed_frames,
+                 g_right.read_wait_ms / g_timed_frames);
+    g_handoff_gpu_ms = 0;
     g_left = {};
     g_right = {};
     g_timed_frames = 0;
@@ -198,6 +202,9 @@ void __fastcall draw_job_detour(void* device) {
         context->End(queries.stamps[1]);
     }
     xr::publish_from_job(views.primary, views.sequence);
+    if (timing) {
+        context->End(queries.stamps[2]);
+    }
 
     // Right eye: same queue, the main camera's SceneBuffer re-uploaded.
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -213,7 +220,7 @@ void __fastcall draw_job_detour(void* device) {
     QueryPerformanceCounter(&t3);
     const uint64_t wait3 = hooks::context::read_map_ticks();
     if (timing) {
-        context->End(queries.stamps[2]);
+        context->End(queries.stamps[3]);
         context->End(queries.disjoint);
         queries.pending = true;
         g_query_index = (g_query_index + 1) % k_query_ring;

@@ -496,17 +496,44 @@ void copy_to_eye(const transport::Frame& frame) {
     }
 }
 
+// Diagnostics (XR thread): what each headset frame took, and stalls.
+uint32_t g_pairs_taken = 0, g_singles_taken = 0, g_frames_without_new = 0;
+Clock::time_point g_last_new_image = Clock::now();
+bool g_stall_logged = false;
+
 // Takes the newest game frame(s): a complete both-eyes pair, or a single image
 // (theater, mono, alternate eyes, or a frame drawn for one eye only).
 void consume_game_frames() {
     transport::Frame left, right;
+    bool took = false;
     if (transport::claim_pair(g_xr_device, left, right)) {
         copy_to_eye(left);
         copy_to_eye(right);
+        ++g_pairs_taken;
+        took = true;
+    } else if (const auto frame = transport::claim_newest(0, g_xr_device)) {
+        copy_to_eye(*frame);
+        ++g_singles_taken;
+        took = true;
+    }
+
+    if (took) {
+        if (g_stall_logged) {
+            logger::info("[xr] headset image resumed after %.0f ms", ms_since(g_last_new_image));
+        }
+        g_last_new_image = Clock::now();
+        g_stall_logged = false;
         return;
     }
-    if (const auto frame = transport::claim_newest(0, g_xr_device)) {
-        copy_to_eye(*frame);
+    ++g_frames_without_new;
+    if (!g_stall_logged && ms_since(g_last_new_image) > 100.0) {
+        const auto l = transport::newest_info(0);
+        const auto r = transport::newest_info(1);
+        logger::warn("[xr] no new game image for %.0f ms: left newest seq %llu%s%s, right newest seq %llu%s%s",
+                     ms_since(g_last_new_image), (unsigned long long)l.sequence, l.paired ? " paired" : "",
+                     l.fresh ? " (untaken)" : "", (unsigned long long)r.sequence, r.paired ? " paired" : "",
+                     r.fresh ? " (untaken)" : "");
+        g_stall_logged = true;
     }
 }
 
@@ -579,11 +606,15 @@ void xr_thread() {
             s.xr_begin = begin_time.take();
             s.xr_copy = copy_time.take();
             s.xr_end = end_time.take();
+            s.pairs_per_second = static_cast<float>(g_pairs_taken * 1000.0 / elapsed);
+            s.singles_per_second = static_cast<float>(g_singles_taken * 1000.0 / elapsed);
+            g_pairs_taken = g_singles_taken = g_frames_without_new = 0;
             if (++windows % 5 == 0) {
                 logger::info("[xr] perf: headset %.1f fps (wait %.2f/%.2f, begin %.2f/%.2f, copy %.2f/%.2f, "
-                             "end %.2f/%.2f ms) | game %.1f fps, dropped %.1f, copy %.2f/%.2f ms",
+                             "end %.2f/%.2f ms, pairs %.1f/s, singles %.1f/s) | game %.1f fps, dropped %.1f, copy %.2f/%.2f ms",
                              s.headset_fps, s.xr_wait.avg_ms, s.xr_wait.max_ms, s.xr_begin.avg_ms, s.xr_begin.max_ms,
-                             s.xr_copy.avg_ms, s.xr_copy.max_ms, s.xr_end.avg_ms, s.xr_end.max_ms, s.game_fps,
+                             s.xr_copy.avg_ms, s.xr_copy.max_ms, s.xr_end.avg_ms, s.xr_end.max_ms, s.pairs_per_second,
+                             s.singles_per_second, s.game_fps,
                              s.dropped_fps, s.game_copy.avg_ms, s.game_copy.max_ms);
             }
             frames = 0;
