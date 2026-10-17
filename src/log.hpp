@@ -12,6 +12,10 @@ void write(const char* level, const std::string& message);
 // Logs the calling thread's stack as exe-relative return addresses (RE helper).
 void backtrace(const char* label);
 
+// Return addresses into the game executable found by scanning the current stack
+// (values that point just after a call instruction). Works without unwind data.
+size_t scan_return_addresses(uintptr_t* out, size_t max, size_t scan_bytes = 16384);
+
 template <typename... Args>
 std::string format(const char* fmt, Args... args) {
     const auto size = std::snprintf(nullptr, 0, fmt, args...);

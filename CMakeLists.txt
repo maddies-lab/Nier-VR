@@ -49,6 +49,7 @@ add_library(nier_vr SHARED
     src/game/build.cpp
     src/game/camera.cpp
     src/game/camera_hook.cpp
+    src/game/census.cpp
     src/game/dump.cpp
     src/game/inspect.cpp
     src/game/watch.cpp

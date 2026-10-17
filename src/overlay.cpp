@@ -5,6 +5,7 @@
 #include <imgui_impl_dx11.h>
 
 #include "game/build.hpp"
+#include "game/census.hpp"
 #include "game/camera.hpp"
 #include "game/inspect.hpp"
 #include "game/watch.hpp"
@@ -136,6 +137,7 @@ void on_present(IDXGISwapChain* swapchain) {
     }
 
     ++g_frame;
+    game::census::on_present(g_context);
     const bool toggle_down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
     if (toggle_down && !g_toggle_was_down) {
         g_visible = !g_visible;
