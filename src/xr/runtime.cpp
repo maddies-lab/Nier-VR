@@ -595,6 +595,11 @@ void xr_thread() {
             Sleep(100);
             continue;
         }
+        // With the headset asleep some runtimes return at once with shouldRender off;
+        // don't spin a core on that.
+        if (!frame.shouldRender && ms_since(start) < 1.0) {
+            Sleep(10);
+        }
         g_predicted_time = frame.predictedDisplayTime;
         g_predicted_period = frame.predictedDisplayPeriod;
 
