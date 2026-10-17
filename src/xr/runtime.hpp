@@ -22,6 +22,8 @@ struct Status {
     const char* transport = "-"; // how frames cross from the game's device to the XR device
     bool head_tracking = false;  // F7
     bool projected = false;      // last submitted frame used a projection layer
+    const char* presentation = "none"; // "theater", "mono" or "stereo"
+    bool stereo = false;         // F5: alternate-eye stereo while head tracking
     int pairing = 1;             // F6: 1 = pose from the previous Present, 0 = newest
     std::string last_error;
     uint32_t width = 0, height = 0;

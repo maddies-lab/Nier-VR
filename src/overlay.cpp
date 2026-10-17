@@ -78,7 +78,7 @@ void draw_window(IDXGISwapChain* swapchain) {
     ImGui::SetNextWindowPos(ImVec2{16, 16}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
     ImGui::Begin("NieR-VR  M1", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("Insert: overlay   F7: head tracking   F8: recenter   F9: camera snapshot   F10: camera watch");
+    ImGui::Text("Insert: overlay  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9/F10: RE");
     ImGui::Separator();
     ImGui::Text("Build: %s (stamp 0x%08X)", g_build.name != nullptr ? g_build.name : "UNKNOWN", g_build.timestamp);
     ImGui::Text("Backbuffer: %u x %u, format %d, frame %llu", desc.BufferDesc.Width, desc.BufferDesc.Height,
@@ -87,8 +87,8 @@ void draw_window(IDXGISwapChain* swapchain) {
     ImGui::Separator();
 
     const auto vr = xr::status();
-    ImGui::Text("OpenXR: %s   mode: %s%s", vr.state, vr.head_tracking ? "head tracking (mono)" : "theater",
-                vr.head_tracking && !vr.projected ? " - waiting for camera" : "");
+    ImGui::Text("OpenXR: %s   F7 head tracking: %s   F5 render: %s   showing: %s", vr.state,
+                vr.head_tracking ? "on" : "off", vr.stereo ? "stereo (alternate eyes)" : "mono", vr.presentation);
     if (vr.head_tracking) {
         ImGui::Text("  F6 pose pairing: %s", vr.pairing ? "previous Present (pipelined)" : "newest");
     }

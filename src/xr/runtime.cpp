@@ -87,13 +87,17 @@ XrSystemId g_system = XR_NULL_SYSTEM_ID;
 XrSession g_session = XR_NULL_HANDLE;
 XrSpace g_local = XR_NULL_HANDLE;
 XrSpace g_view = XR_NULL_HANDLE;
-XrSwapchain g_swapchain = XR_NULL_HANDLE;
-std::vector<ID3D11Texture2D*> g_images;
-uint32_t g_swapchain_width = 0, g_swapchain_height = 0;
-DXGI_FORMAT g_swapchain_source_format = DXGI_FORMAT_UNKNOWN;
-bool g_image_ready = false; // the swapchain holds at least one released game frame
+// One swapchain per eye. Slot 0 also carries mono and theater frames.
+struct EyeImage {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    std::vector<ID3D11Texture2D*> images;
+    uint32_t width = 0, height = 0;
+    DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
+    bool ready = false;          // holds at least one released game frame
+    transport::FrameMeta meta;   // how that frame was rendered
+};
+EyeImage g_eye_images[2];
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
-transport::FrameMeta g_image_meta; // how the image currently in the swapchain was rendered
 
 // Written by the XR thread, read by game threads in begin_render_view.
 std::mutex g_view_mutex;
@@ -104,6 +108,9 @@ math::Vec3 g_reference_position{};   // head position that maps to the game came
 std::atomic<int64_t> g_predicted_time{0};
 std::atomic<int64_t> g_predicted_period{0};
 std::atomic<bool> g_head_tracking{false};
+std::atomic<bool> g_stereo{true}; // F5: alternate-eye stereo (else mono) while head tracking
+int g_next_eye = 0;               // game thread: eye rendered by the next camera update
+bool g_stereo_key_was_down = false; // render thread only
 
 // The view rendered this frame (game threads), sent with the frame at Present.
 std::mutex g_frame_meta_mutex;
@@ -380,13 +387,13 @@ DXGI_FORMAT srgb_variant(DXGI_FORMAT format) {
     }
 }
 
-bool create_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT source_format) {
-    if (g_swapchain != XR_NULL_HANDLE) {
-        fn::xrDestroySwapchain(g_swapchain);
-        g_swapchain = XR_NULL_HANDLE;
+bool create_swapchain(EyeImage& eye, uint32_t width, uint32_t height, DXGI_FORMAT source_format) {
+    if (eye.swapchain != XR_NULL_HANDLE) {
+        fn::xrDestroySwapchain(eye.swapchain);
+        eye.swapchain = XR_NULL_HANDLE;
     }
-    g_images.clear();
-    g_image_ready = false;
+    eye.images.clear();
+    eye.ready = false;
 
     uint32_t count = 0;
     fn::xrEnumerateSwapchainFormats(g_session, 0, &count, nullptr);
@@ -418,21 +425,21 @@ bool create_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT source_format
     info.faceCount = 1;
     info.arraySize = 1;
     info.mipCount = 1;
-    if (!check(fn::xrCreateSwapchain(g_session, &info, &g_swapchain), "xrCreateSwapchain")) {
+    if (!check(fn::xrCreateSwapchain(g_session, &info, &eye.swapchain), "xrCreateSwapchain")) {
         return false;
     }
 
-    fn::xrEnumerateSwapchainImages(g_swapchain, 0, &count, nullptr);
+    fn::xrEnumerateSwapchainImages(eye.swapchain, 0, &count, nullptr);
     std::vector<XrSwapchainImageD3D11KHR> images(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-    fn::xrEnumerateSwapchainImages(g_swapchain, count, &count,
+    fn::xrEnumerateSwapchainImages(eye.swapchain, count, &count,
                                    reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
     for (const auto& image : images) {
-        g_images.push_back(image.texture);
+        eye.images.push_back(image.texture);
     }
 
-    g_swapchain_width = width;
-    g_swapchain_height = height;
-    g_swapchain_source_format = source_format;
+    eye.width = width;
+    eye.height = height;
+    eye.source_format = source_format;
     {
         std::scoped_lock _{g_status_mutex};
         g_status.width = width;
@@ -442,16 +449,17 @@ bool create_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT source_format
     return true;
 }
 
-// Copies the newest game frame into the swapchain, if there is one.
+// Copies the newest game frame into its eye's swapchain, if there is one.
 void consume_game_frame() {
     const auto frame = transport::claim_newest(g_xr_device);
     if (!frame) {
         return;
     }
 
-    if (g_swapchain == XR_NULL_HANDLE || frame->width != g_swapchain_width || frame->height != g_swapchain_height ||
-        frame->format != g_swapchain_source_format) {
-        if (!create_swapchain(frame->width, frame->height, frame->format)) {
+    auto& eye = g_eye_images[frame->meta.eye == 1 ? 1 : 0];
+    if (eye.swapchain == XR_NULL_HANDLE || frame->width != eye.width || frame->height != eye.height ||
+        frame->format != eye.source_format) {
+        if (!create_swapchain(eye, frame->width, frame->height, frame->format)) {
             transport::release(*frame);
             return;
         }
@@ -461,21 +469,36 @@ void consume_game_frame() {
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wait.timeout = XR_INFINITE_DURATION;
-    if (!check(fn::xrAcquireSwapchainImage(g_swapchain, &acquire, &index), "xrAcquireSwapchainImage")) {
+    if (!check(fn::xrAcquireSwapchainImage(eye.swapchain, &acquire, &index), "xrAcquireSwapchainImage")) {
         transport::release(*frame);
         return;
     }
-    if (!check(fn::xrWaitSwapchainImage(g_swapchain, &wait), "xrWaitSwapchainImage")) {
+    if (!check(fn::xrWaitSwapchainImage(eye.swapchain, &wait), "xrWaitSwapchainImage")) {
         transport::release(*frame);
     } else {
-        transport::copy_and_release(*frame, g_xr_context, g_images.at(index));
-        g_image_meta = frame->meta;
+        transport::copy_and_release(*frame, g_xr_context, eye.images.at(index));
+        eye.meta = frame->meta;
     }
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    if (check(fn::xrReleaseSwapchainImage(g_swapchain, &release_info), "xrReleaseSwapchainImage")) {
-        g_image_ready = true;
+    if (check(fn::xrReleaseSwapchainImage(eye.swapchain, &release_info), "xrReleaseSwapchainImage")) {
+        eye.ready = true;
     }
+}
+
+XrSwapchainSubImage sub_image(const EyeImage& eye) {
+    XrSwapchainSubImage image{};
+    image.swapchain = eye.swapchain;
+    image.imageRect = {{0, 0}, {static_cast<int32_t>(eye.width), static_cast<int32_t>(eye.height)}};
+    return image;
+}
+
+void fill_projection_view(XrCompositionLayerProjectionView& view, const EyeImage& eye) {
+    const auto& meta = eye.meta;
+    view.pose.orientation = {meta.orientation[0], meta.orientation[1], meta.orientation[2], meta.orientation[3]};
+    view.pose.position = {meta.position[0], meta.position[1], meta.position[2]};
+    view.fov = {std::atan(meta.tan_left), std::atan(meta.tan_right), std::atan(meta.tan_up), std::atan(meta.tan_down)};
+    view.subImage = sub_image(eye);
 }
 
 // Puts the screen straight ahead of the head, level, yaw only, and makes this head
@@ -599,36 +622,36 @@ void xr_thread() {
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* layers[1]{};
         uint32_t layer_count = 0;
-        if (frame.shouldRender && g_image_ready) {
-            XrSwapchainSubImage image{};
-            image.swapchain = g_swapchain;
-            image.imageRect = {{0, 0}, {static_cast<int32_t>(g_swapchain_width), static_cast<int32_t>(g_swapchain_height)}};
-
-            const auto& meta = g_image_meta;
-            if (meta.projected) {
-                // M2 is mono: both eyes get the one image, rendered from the head pose
-                // with a frustum covering both eyes; the compositor reprojects it.
-                XrPosef pose{};
-                pose.orientation = {meta.orientation[0], meta.orientation[1], meta.orientation[2], meta.orientation[3]};
-                pose.position = {meta.position[0], meta.position[1], meta.position[2]};
-                const XrFovf fov{std::atan(meta.tan_left), std::atan(meta.tan_right), std::atan(meta.tan_up),
-                                 std::atan(meta.tan_down)};
-                for (auto& view : projection_views) {
-                    view.pose = pose;
-                    view.fov = fov;
-                    view.subImage = image;
-                }
+        const auto& left = g_eye_images[0];
+        const auto& right = g_eye_images[1];
+        const char* presentation = "none";
+        if (frame.shouldRender && left.ready) {
+            if (left.meta.projected && left.meta.eye == 0 && right.ready && right.meta.projected &&
+                right.meta.eye == 1) {
+                // Stereo: each eye's own image, pose and frustum (rendered on alternate game frames).
+                fill_projection_view(projection_views[0], left);
+                fill_projection_view(projection_views[1], right);
+                presentation = "stereo";
+            } else if (left.meta.projected && left.meta.eye < 0) {
+                // Mono: both eyes get the one image, rendered from the head pose with a
+                // frustum covering both eyes; the compositor reprojects it per eye.
+                fill_projection_view(projection_views[0], left);
+                fill_projection_view(projection_views[1], left);
+                presentation = "mono";
+            } else {
+                quad.space = g_local;
+                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quad.subImage = sub_image(left);
+                quad.pose = g_screen_pose;
+                quad.size = {k_screen_width, k_screen_width * left.height / left.width};
+                layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+                presentation = "theater";
+            }
+            if (layers[0] == nullptr) {
                 projection.space = g_local;
                 projection.viewCount = 2;
                 projection.views = projection_views;
                 layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
-            } else {
-                quad.space = g_local;
-                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-                quad.subImage = image;
-                quad.pose = g_screen_pose;
-                quad.size = {k_screen_width, k_screen_width * g_swapchain_height / g_swapchain_width};
-                layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
             }
             layer_count = 1;
         }
@@ -644,9 +667,10 @@ void xr_thread() {
         if (check(ended, "xrEndFrame")) {
             ++frames;
         }
-        if (layer_count > 0 && g_image_meta.projected != g_status.projected) {
+        if (layer_count > 0 && presentation != g_status.presentation) {
             std::scoped_lock _{g_status_mutex};
-            g_status.projected = g_image_meta.projected;
+            g_status.presentation = presentation;
+            g_status.projected = std::string_view{presentation} != "theater";
         }
     }
 }
@@ -739,6 +763,13 @@ void on_present(IDXGISwapChain* swapchain) {
     }
     g_pairing_key_was_down = pairing_down;
 
+    const bool stereo_down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    if (stereo_down && !g_stereo_key_was_down) {
+        g_stereo = !g_stereo;
+        logger::info("[xr] %s", g_stereo ? "stereo (alternate eyes)" : "mono");
+    }
+    g_stereo_key_was_down = stereo_down;
+
     trace("present");
     static int present_count = 0;
     if (++present_count == 600) {
@@ -763,6 +794,7 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.transport = transport::description();
         g_status.head_tracking = g_head_tracking;
         g_status.pairing = g_pairing;
+        g_status.stereo = g_stereo;
         g_game_frames = 0;
         g_dropped_frames = 0;
         g_game_window_start = Clock::now();
@@ -791,11 +823,6 @@ bool begin_render_view(float aspect, RenderView& view) {
 
     // The frame rendered now reaches the compositor about one headset frame later.
     const XrTime time = predicted + g_predicted_period;
-    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-    if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
-        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
-        return false;
-    }
 
     XrFovf fov[2];
     float reference_yaw;
@@ -811,28 +838,66 @@ bool begin_render_view(float aspect, RenderView& view) {
         reference_position = g_reference_position;
     }
 
-    const auto& o = location.pose.orientation;
-    const auto& p = location.pose.position;
+    // Pose to render from: one eye per frame in stereo, the head in mono.
+    XrPosef pose{};
+    int eye = -1;
+    if (g_stereo) {
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = time;
+        locate.space = g_local;
+        XrViewState state{XR_TYPE_VIEW_STATE};
+        XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t count = 0;
+        if (XR_FAILED(fn::xrLocateViews(g_session, &locate, &state, 2, &count, views)) || count != 2 ||
+            (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+            return false;
+        }
+        eye = g_next_eye;
+        g_next_eye ^= 1;
+        pose = views[eye].pose;
+        fov[0] = views[eye].fov;
+    } else {
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
+            (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
+            return false;
+        }
+        pose = location.pose;
+    }
+
+    const auto& o = pose.orientation;
+    const auto& p = pose.position;
     const math::Quat head{o.x, o.y, o.z, o.w};
     const math::Vec3 head_position{p.x, p.y, p.z};
     const math::Quat to_reference = math::yaw_rotation(-reference_yaw);
     view.head_orientation = to_reference * head;
     view.head_position = math::rotate(to_reference, head_position - reference_position);
 
-    // One frustum covering both eyes, widened to the game's aspect.
-    float left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
-    float right = std::max(std::tan(fov[0].angleRight), std::tan(fov[1].angleRight));
-    float up = std::max(std::tan(fov[0].angleUp), std::tan(fov[1].angleUp));
-    float down = std::min(std::tan(fov[0].angleDown), std::tan(fov[1].angleDown));
-    const float width = right - left, height = up - down;
-    if (width / height < aspect) {
-        const float extra = (aspect * height - width) * 0.5f;
-        left -= extra;
-        right += extra;
+    float left, right, up, down;
+    if (eye >= 0) {
+        // Stereo: the eye's own frustum squeezed into the game's 16:9 frame
+        // (anamorphic); the compositor maps it back by the submitted fov.
+        left = std::tan(fov[0].angleLeft);
+        right = std::tan(fov[0].angleRight);
+        up = std::tan(fov[0].angleUp);
+        down = std::tan(fov[0].angleDown);
     } else {
-        const float extra = (width / aspect - height) * 0.5f;
-        up += extra;
-        down -= extra;
+        // Mono: one frustum covering both eyes, widened to the game's aspect.
+        left = std::min(std::tan(fov[0].angleLeft), std::tan(fov[1].angleLeft));
+        right = std::max(std::tan(fov[0].angleRight), std::tan(fov[1].angleRight));
+        up = std::max(std::tan(fov[0].angleUp), std::tan(fov[1].angleUp));
+        down = std::min(std::tan(fov[0].angleDown), std::tan(fov[1].angleDown));
+        const float width = right - left, height = up - down;
+        if (width / height < aspect) {
+            const float extra = (aspect * height - width) * 0.5f;
+            left -= extra;
+            right += extra;
+        } else {
+            const float extra = (width / aspect - height) * 0.5f;
+            up += extra;
+            down -= extra;
+        }
     }
     view.tan_left = left;
     view.tan_right = right;
@@ -841,6 +906,7 @@ bool begin_render_view(float aspect, RenderView& view) {
 
     transport::FrameMeta meta;
     meta.projected = true;
+    meta.eye = eye;
     meta.orientation[0] = o.x;
     meta.orientation[1] = o.y;
     meta.orientation[2] = o.z;

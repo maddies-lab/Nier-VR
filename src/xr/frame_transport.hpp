@@ -21,6 +21,7 @@ namespace xr::transport {
 // How the XR side should present a frame.
 struct FrameMeta {
     bool projected = false;                    // false: theater quad; true: projection layer
+    int eye = -1;                              // -1 mono/theater, 0 left, 1 right
     float orientation[4]{0, 0, 0, 1};          // head pose the frame was rendered for (LOCAL space)
     float position[3]{};
     float tan_left = 0, tan_right = 0, tan_up = 0, tan_down = 0;
