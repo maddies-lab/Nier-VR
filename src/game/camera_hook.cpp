@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include <windows.h>
 
@@ -40,6 +41,44 @@ math::Mat4 g_last_view_projection{};
 bool g_have_last = false;
 float g_last_yaw_forward[2] = {0.0f, -1.0f}; // fallback when the camera looks straight up/down
 
+// cCameraGame+0x390 values whose screens stay on the theater screen. 44 (0x2C) is
+// the camera the game uses without a player to follow: the teleport and pause
+// menu maps (the user's 2026-10-17 session).
+constexpr int k_theater_modes[] = {44};
+int g_last_main_mode = -1;
+
+int main_camera_mode(const CameraGame* camera) {
+    return *reinterpret_cast<const int*>(reinterpret_cast<uintptr_t>(camera) + 0x390);
+}
+
+bool is_theater_mode(int mode) {
+    return std::find(std::begin(k_theater_modes), std::end(k_theater_modes), mode) != std::end(k_theater_modes);
+}
+
+// RE log: each distinct (caller, CameraData, cCameraGame mode) combination, so
+// screens like the pause menu's 3D map can be told apart from gameplay.
+struct Signature {
+    uintptr_t caller = 0;
+    const void* data = nullptr;
+    int mode = -1;
+    bool operator==(const Signature& o) const { return caller == o.caller && data == o.data && mode == o.mode; }
+};
+std::vector<Signature> g_seen_signatures;
+
+void log_signature(uintptr_t return_address, const void* data, bool main_camera) {
+    const auto camera = CameraGame::get();
+    const int mode = camera != nullptr ? *reinterpret_cast<const int*>(reinterpret_cast<uintptr_t>(camera) + 0x390) : -1;
+    const Signature signature{return_address, data, main_camera ? mode : -1};
+    if (g_seen_signatures.size() >= 64 ||
+        std::find(g_seen_signatures.begin(), g_seen_signatures.end(), signature) != g_seen_signatures.end()) {
+        return;
+    }
+    g_seen_signatures.push_back(signature);
+    const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    logger::info("[camera_hook] new: update from exe+0x%llx, data %p (%s), camera mode %d",
+                 (unsigned long long)(return_address - exe), data, main_camera ? "main" : "other", mode);
+}
+
 template <typename T>
 T& field(CameraData* data, uintptr_t offset) {
     return *reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(data) + offset);
@@ -61,9 +100,18 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
                               int save_previous, int update_frustum) {
     const auto camera = CameraGame::get();
     CameraData* data = *holder;
+    log_signature(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), data,
+                  camera != nullptr && camera->data() == data);
     if (camera == nullptr || data == nullptr || camera->data() != data) {
         g_original(holder, eye, target, up, save_previous, update_frustum);
         return;
+    }
+
+    const int mode = main_camera_mode(camera);
+    if (mode != g_last_main_mode) {
+        logger::info("[camera_hook] main camera mode %d -> %d%s", g_last_main_mode, mode,
+                     is_theater_mode(mode) ? " (theater)" : "");
+        g_last_main_mode = mode;
     }
 
     // The game's own fov/aspect: our wide values are only present during the
@@ -74,7 +122,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
 
     xr::trace("update");
     xr::RenderView view;
-    if (game_aspect <= 0.0f || !xr::begin_render_view(game_aspect, view)) {
+    if (game_aspect <= 0.0f || is_theater_mode(mode) || !xr::begin_render_view(game_aspect, view)) {
         if (g_projection_is_ours) {
             field<int>(data, k_projection_dirty) = 1; // rebuild the game's own projection
             g_projection_is_ours = false;
