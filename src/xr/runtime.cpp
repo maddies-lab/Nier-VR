@@ -740,6 +740,10 @@ void on_present(IDXGISwapChain* swapchain) {
     g_pairing_key_was_down = pairing_down;
 
     trace("present");
+    static int present_count = 0;
+    if (++present_count == 600) {
+        logger::backtrace("Present");
+    }
 
     if (g_running) {
         const auto start = Clock::now();

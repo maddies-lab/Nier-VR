@@ -9,6 +9,9 @@ void open();
 
 void write(const char* level, const std::string& message);
 
+// Logs the calling thread's stack as exe-relative return addresses (RE helper).
+void backtrace(const char* label);
+
 template <typename... Args>
 std::string format(const char* fmt, Args... args) {
     const auto size = std::snprintf(nullptr, 0, fmt, args...);

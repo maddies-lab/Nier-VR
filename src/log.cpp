@@ -19,6 +19,24 @@ void open() {
     g_file = _wfopen(log_path.c_str(), L"w");
 }
 
+void backtrace(const char* label) {
+    void* frames[48]{};
+    const auto count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+    const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::string line;
+    for (USHORT i = 0; i < count; ++i) {
+        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+        char entry[40];
+        if (address >= exe && address < exe + 0x2000000) {
+            std::snprintf(entry, sizeof(entry), " exe+0x%llx", (unsigned long long)(address - exe));
+        } else {
+            std::snprintf(entry, sizeof(entry), " %p", frames[i]);
+        }
+        line += entry;
+    }
+    write("info", std::string{"[stack] "} + label + " (thread " + std::to_string(GetCurrentThreadId()) + "):" + line);
+}
+
 void write(const char* level, const std::string& message) {
     std::scoped_lock _{g_mutex};
     if (g_file == nullptr) {

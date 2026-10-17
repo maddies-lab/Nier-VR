@@ -128,6 +128,11 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
         return;
     }
 
+    static int update_count = 0;
+    if (++update_count == 600) {
+        logger::backtrace("UpdateCameraData (main camera)");
+    }
+
     const int mode = main_camera_mode(camera);
     if (mode != g_last_main_mode) {
         logger::info("[camera_hook] main camera mode %d -> %d%s", g_last_main_mode, mode,

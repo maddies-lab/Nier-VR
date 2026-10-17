@@ -21,6 +21,7 @@ struct Hit {
     std::atomic<uintptr_t> address{0}; // instruction after the access (data breakpoints trap afterwards)
     std::atomic<uint32_t> count{0};
     std::atomic<uint32_t> slots{0};    // DR6 bits 0-3; bit 4 = DR6 not reported
+    std::atomic<uint32_t> thread{0};   // first thread seen
 };
 
 Hit g_hits[k_max_hits];
@@ -36,6 +37,7 @@ void record(uintptr_t address, uint32_t slots) {
         uintptr_t current = hit.address.load();
         if (current == 0 && hit.address.compare_exchange_strong(current, address)) {
             current = address;
+            hit.thread = GetCurrentThreadId();
         }
         if (current == address) {
             hit.count.fetch_add(1);
@@ -118,12 +120,12 @@ void log_results() {
     const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     struct Row {
         uintptr_t address;
-        uint32_t count, slots;
+        uint32_t count, slots, thread;
     };
     std::vector<Row> rows;
     for (auto& hit : g_hits) {
         if (const auto address = hit.address.load()) {
-            rows.push_back({address, hit.count.load(), hit.slots.load()});
+            rows.push_back({address, hit.count.load(), hit.slots.load(), hit.thread.load()});
         }
     }
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.count > b.count; });
@@ -141,8 +143,8 @@ void log_results() {
             std::snprintf(labels + strlen(labels), sizeof(labels) - strlen(labels), " [DR6 not reported]");
         }
         const bool in_exe = row.address >= exe && row.address < exe + 0x2000000;
-        logger::info("[watch] %s+0x%llx  x%u%s", in_exe ? "exe" : "abs",
-                     (unsigned long long)(in_exe ? row.address - exe : row.address), row.count, labels);
+        logger::info("[watch] %s+0x%llx  x%u  thread %u%s", in_exe ? "exe" : "abs",
+                     (unsigned long long)(in_exe ? row.address - exe : row.address), row.count, row.thread, labels);
     }
 }
 } // namespace
@@ -188,11 +190,12 @@ void start_camera_watch() {
     }
 
     const auto data = reinterpret_cast<uintptr_t>(camera->data());
+    // M3: who reads the camera after the update (render-side copies, and on which thread).
     const Target targets[4] = {
-        {"view write (data+0x00)", data + 0x00, Access::write},
-        {"projection write (data+0x40)", data + 0x40, Access::write},
-        {"viewproj access (data+0x80)", data + 0x80, Access::read_write},
-        {"eye write (cam+0x10)", reinterpret_cast<uintptr_t>(camera) + 0x10, Access::write},
+        {"view (data+0x00)", data + 0x00, Access::read_write},
+        {"projection (data+0x40)", data + 0x40, Access::read_write},
+        {"viewproj (data+0x80)", data + 0x80, Access::read_write},
+        {"camera-to-world (data+0xC0)", data + 0xC0, Access::read_write},
     };
     start(targets, 3000);
 }
