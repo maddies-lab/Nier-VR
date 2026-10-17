@@ -1,6 +1,7 @@
 #include "game/camera_hook.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -41,10 +42,28 @@ math::Mat4 g_last_view_projection{};
 bool g_have_last = false;
 float g_last_yaw_forward[2] = {0.0f, -1.0f}; // fallback when the camera looks straight up/down
 
-// cCameraGame+0x390 values whose screens stay on the theater screen. 44 (0x2C) is
-// the camera the game uses without a player to follow: the teleport and pause
-// menu maps (the user's 2026-10-17 session).
-constexpr int k_theater_modes[] = {44};
+// cCameraGame+0x390 values whose screens stay on the theater screen (the user's
+// 2026-10-17 sessions): 3 = quick-warp map, 44 (0x2C) = no player to follow
+// (intro cutscene). The pause-menu map keeps mode 0; it is caught by the paused check.
+constexpr int k_theater_modes[] = {3, 44};
+
+// cCameraGame's per-frame update (vtable slot 2). While the game is paused (pause
+// menu and its map) it stops running, but the map still drives the camera matrices.
+using CameraUpdateFn = void(__fastcall*)(void* camera);
+CameraUpdateFn g_camera_update_original = nullptr;
+std::atomic<uint64_t> g_camera_update_ms{0};
+constexpr uint64_t k_paused_after_ms = 50;
+bool g_was_paused = false;
+
+void __fastcall camera_update_detour(void* camera) {
+    g_camera_update_ms = GetTickCount64();
+    g_camera_update_original(camera);
+}
+
+bool game_paused() {
+    const uint64_t last = g_camera_update_ms;
+    return last != 0 && GetTickCount64() - last > k_paused_after_ms;
+}
 int g_last_main_mode = -1;
 
 int main_camera_mode(const CameraGame* camera) {
@@ -113,6 +132,11 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
                      is_theater_mode(mode) ? " (theater)" : "");
         g_last_main_mode = mode;
     }
+    const bool paused = game_paused();
+    if (paused != g_was_paused) {
+        logger::info("[camera_hook] game camera %s", paused ? "paused (theater)" : "running");
+        g_was_paused = paused;
+    }
 
     // The game's own fov/aspect: our wide values are only present during the
     // original call below, because the camera controller eases from the stored fov
@@ -122,7 +146,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
 
     xr::trace("update");
     xr::RenderView view;
-    if (game_aspect <= 0.0f || is_theater_mode(mode) || !xr::begin_render_view(game_aspect, view)) {
+    if (game_aspect <= 0.0f || is_theater_mode(mode) || paused || !xr::begin_render_view(game_aspect, view)) {
         if (g_projection_is_ours) {
             field<int>(data, k_projection_dirty) = 1; // rebuild the game's own projection
             g_projection_is_ours = false;
@@ -220,6 +244,17 @@ bool install() {
 
     logger::info("[camera_hook] UpdateCameraData hooked at exe+0x%llx",
                  (unsigned long long)(*target - reinterpret_cast<uintptr_t>(exe)));
+
+    // The pause detector is optional: without it the pause-menu map stays head-tracked.
+    const auto update = reinterpret_cast<void**>(CameraGame::vtable())[2];
+    if (MH_CreateHook(update, reinterpret_cast<void*>(&camera_update_detour),
+                      reinterpret_cast<void**>(&g_camera_update_original)) == MH_OK &&
+        MH_EnableHook(update) == MH_OK) {
+        logger::info("[camera_hook] cCameraGame update hooked at exe+0x%llx",
+                     (unsigned long long)(reinterpret_cast<uintptr_t>(update) - reinterpret_cast<uintptr_t>(exe)));
+    } else {
+        logger::warn("[camera_hook] could not hook the cCameraGame update; pause detection off");
+    }
     return true;
 }
 } // namespace game::camera_hook
