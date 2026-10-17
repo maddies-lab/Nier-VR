@@ -43,9 +43,11 @@ bool g_have_last = false;
 float g_last_yaw_forward[2] = {0.0f, -1.0f}; // fallback when the camera looks straight up/down
 
 // cCameraGame+0x390 values whose screens stay on the theater screen (the user's
-// 2026-10-17 sessions): 3 = quick-warp map, 44 (0x2C) = no player to follow
-// (intro cutscene). The pause-menu map keeps mode 0; it is caught by the paused check.
-constexpr int k_theater_modes[] = {3, 44};
+// 2026-10-17 sessions): 44 (0x2C) = no player to follow (intro cutscene).
+// Other modes seen: 0 = gameplay (also teleport cutscenes), 3 = the hub's 2D
+// side-scrolling camera (head-tracked). Menus and maps pause the game camera and
+// are caught by the paused check instead.
+constexpr int k_theater_modes[] = {44};
 
 // cCameraGame's per-frame update (vtable slot 2). While the game is paused (pause
 // menu and its map) it stops running, but the map still drives the camera matrices.
