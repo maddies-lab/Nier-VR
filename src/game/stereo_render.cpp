@@ -251,6 +251,169 @@ bool upload_right_eye(ID3D11DeviceContext* context, const float (&scene)[64]) {
 
 std::atomic<uint64_t> g_doubled{0}, g_single{0};
 
+// GPU state the draw job carries across frames (read-modify-write: eye adaptation,
+// GPU particles, history buffers) must be the same at the start of both passes,
+// or the right eye sees it one step further. Resources the job writes through
+// UAVs, and small render targets, are learned during the left pass; from the next
+// frame on they are snapshotted before the left pass and restored before the right.
+// Full-size render targets are left out: the job redraws them every pass.
+constexpr UINT k_small_target_pixels = 512 * 512;
+constexpr uint64_t k_forget_after_frames = 300;
+constexpr size_t k_max_tracked = 256;
+
+struct Tracked {
+    ID3D11Resource* resource = nullptr; // AddRef'd
+    ID3D11Resource* backup = nullptr;
+    uint64_t last_written = 0;          // frame the left pass last wrote it
+    uint64_t bytes = 0;
+};
+std::vector<Tracked> g_tracked;         // draw-job thread only
+std::vector<ID3D11Resource*> g_written; // this left pass (collected by the binding hooks)
+std::mutex g_written_mutex;
+uint64_t g_frame_index = 0;
+bool g_restore_enabled = true;          // F3 toggles (A/B test)
+bool g_restore_key_was_down = false;
+
+// Bytes per pixel of the formats we care to size; others count as 8.
+uint64_t texture_bytes(const D3D11_TEXTURE2D_DESC& d) {
+    return uint64_t(d.Width) * d.Height * std::max<UINT>(1, d.ArraySize) * 8;
+}
+
+void on_write_views(ID3D11View* const* views, UINT count) {
+    std::scoped_lock _{g_written_mutex};
+    for (UINT i = 0; i < count; ++i) {
+        if (views[i] == nullptr) {
+            continue;
+        }
+        ID3D11Resource* resource = nullptr;
+        views[i]->GetResource(&resource);
+        if (resource == nullptr) {
+            continue;
+        }
+
+        // UAVs: always. Render targets: only small ones.
+        ID3D11UnorderedAccessView* uav = nullptr;
+        const bool is_uav =
+            SUCCEEDED(views[i]->QueryInterface(__uuidof(ID3D11UnorderedAccessView), reinterpret_cast<void**>(&uav)));
+        if (uav != nullptr) {
+            uav->Release();
+        }
+        bool keep = is_uav;
+        if (!keep) {
+            D3D11_RESOURCE_DIMENSION dimension{};
+            resource->GetType(&dimension);
+            if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+                D3D11_TEXTURE2D_DESC desc{};
+                static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+                keep = desc.Width * desc.Height <= k_small_target_pixels;
+            }
+        }
+        if (keep && std::find(g_written.begin(), g_written.end(), resource) == g_written.end()) {
+            g_written.push_back(resource);
+        }
+        resource->Release(); // the game owns it; Tracked AddRefs what it keeps
+    }
+}
+
+ID3D11Resource* create_backup(ID3D11Device* device, ID3D11Resource* resource, uint64_t& bytes) {
+    D3D11_RESOURCE_DIMENSION dimension{};
+    resource->GetType(&dimension);
+    ID3D11Resource* backup = nullptr;
+    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        D3D11_BUFFER_DESC desc{};
+        static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        bytes = desc.ByteWidth;
+        device->CreateBuffer(&desc, nullptr, reinterpret_cast<ID3D11Buffer**>(&backup));
+    } else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC desc{};
+        static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+        if (desc.SampleDesc.Count > 1) {
+            return nullptr;
+        }
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                            D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+        bytes = texture_bytes(desc);
+        device->CreateTexture2D(&desc, nullptr, reinterpret_cast<ID3D11Texture2D**>(&backup));
+    } else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D) {
+        D3D11_TEXTURE3D_DESC desc{};
+        static_cast<ID3D11Texture3D*>(resource)->GetDesc(&desc);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags &= ~D3D11_RESOURCE_MISC_SHARED;
+        bytes = uint64_t(desc.Width) * desc.Height * desc.Depth * 8;
+        device->CreateTexture3D(&desc, nullptr, reinterpret_cast<ID3D11Texture3D**>(&backup));
+    }
+    return backup;
+}
+
+// After the left pass: adopt newly written resources, forget stale ones.
+void update_tracked(ID3D11DeviceContext* context) {
+    std::vector<ID3D11Resource*> written;
+    {
+        std::scoped_lock _{g_written_mutex};
+        written.swap(g_written);
+    }
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    bool changed = false;
+    for (auto resource : written) {
+        auto it = std::find_if(g_tracked.begin(), g_tracked.end(),
+                               [&](const Tracked& t) { return t.resource == resource; });
+        if (it != g_tracked.end()) {
+            it->last_written = g_frame_index;
+            continue;
+        }
+        if (g_tracked.size() >= k_max_tracked || device == nullptr) {
+            continue;
+        }
+        uint64_t bytes = 0;
+        if (auto backup = create_backup(device, resource, bytes)) {
+            resource->AddRef();
+            g_tracked.push_back({resource, backup, g_frame_index, bytes});
+            changed = true;
+        }
+    }
+    if (device != nullptr) {
+        device->Release();
+    }
+
+    const auto before = g_tracked.size();
+    g_tracked.erase(std::remove_if(g_tracked.begin(), g_tracked.end(),
+                                   [](Tracked& t) {
+                                       if (g_frame_index - t.last_written <= k_forget_after_frames) {
+                                           return false;
+                                       }
+                                       t.backup->Release();
+                                       t.resource->Release();
+                                       return true;
+                                   }),
+                    g_tracked.end());
+    if (changed || g_tracked.size() != before) {
+        uint64_t total = 0;
+        for (const auto& t : g_tracked) {
+            total += t.bytes;
+        }
+        logger::info("[stereo] per-pass GPU state: %zu resources tracked (~%.1f MB)", g_tracked.size(),
+                     total / 1048576.0);
+    }
+}
+
+void snapshot_state(ID3D11DeviceContext* context) {
+    for (const auto& t : g_tracked) {
+        context->CopyResource(t.backup, t.resource);
+    }
+}
+
+void restore_state(ID3D11DeviceContext* context) {
+    for (const auto& t : g_tracked) {
+        context->CopyResource(t.resource, t.backup);
+    }
+}
+
 // Per-pass timing, logged every 300 doubled frames: CPU time of each job run, the
 // part of it spent waiting in Map(READ), and GPU time from timestamp queries.
 struct PassTimes {
@@ -370,11 +533,17 @@ void __fastcall draw_job_detour(void* device) {
         context->End(queries.stamps[0]);
     }
 
-    // Left eye: the queue as recorded and uploaded.
+    // Left eye: the queue as recorded and uploaded, from snapshotted GPU state.
+    ++g_frame_index;
+    if (g_restore_enabled) {
+        snapshot_state(context);
+    }
     LARGE_INTEGER t0, t1, t2;
     uint64_t wait0 = hooks::context::read_map_ticks();
     QueryPerformanceCounter(&t0);
+    hooks::context::set_write_observation(true);
     g_draw_job(device);
+    hooks::context::set_write_observation(false);
     QueryPerformanceCounter(&t1);
     const uint64_t wait1 = hooks::context::read_map_ticks();
     if (timing) {
@@ -385,7 +554,12 @@ void __fastcall draw_job_detour(void* device) {
         context->End(queries.stamps[2]);
     }
 
-    // Right eye: same queue, the camera uploads redone with the right eye.
+    // Right eye: same queue and the same starting GPU state, the camera uploads
+    // redone with the right eye.
+    if (g_restore_enabled) {
+        restore_state(context);
+    }
+    update_tracked(context);
     if (!g_same_camera_test && !upload_right_eye(context, views.secondary_scene)) {
         return;
     }
@@ -445,7 +619,7 @@ bool install() {
 
 void on_present(ID3D11DeviceContext* context) {
     if (!g_registered && context != nullptr && hooks::context::install(context)) {
-        hooks::context::add_observer({on_map, on_unmap, nullptr});
+        hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views});
         g_registered = true;
     }
     const bool test_down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
@@ -456,6 +630,13 @@ void on_present(ID3D11DeviceContext* context) {
                                                                            : "uses the right camera");
     }
     g_test_key_was_down = test_down;
+
+    const bool restore_down = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+    if (restore_down && !g_restore_key_was_down) {
+        g_restore_enabled = !g_restore_enabled;
+        logger::info("[stereo] F3: per-pass GPU state restore %s", g_restore_enabled ? "on" : "off");
+    }
+    g_restore_key_was_down = restore_down;
 
     // The next frame's uploads start after this Present.
     std::scoped_lock _{g_uploads_mutex};
