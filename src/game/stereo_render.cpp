@@ -38,6 +38,43 @@ using ExecuteFn = void(__fastcall*)(void* queue, void* device);
 ExecuteFn g_execute = nullptr;
 using CommandFn = void(__fastcall*)(void* device, void* key, void* argument);
 
+// Per-object light records: the main thread pushes them onto a lock-free stack
+// while building the frame (tag 'L', exe+0x214100), and one render command
+// (exe+0x776530 -> drain loop exe+0x21C560) pops and draws them all. Run twice, the
+// left pass emptied the stack and the right pass drew no lights (Pod bullets lit
+// in one eye and dark in the other, hit flashes missing in one eye). The left pass
+// records what it pops; the right pass is handed the same records again. They stay
+// valid for the frame: the stack is reset when the next frame is built.
+using PopFn = void*(__fastcall*)();
+PopFn g_pop_light = nullptr;
+enum class LightMode : int { pass_through, record, replay };
+std::atomic<LightMode> g_light_mode{LightMode::pass_through};
+std::vector<void*> g_lights; // draw-job thread
+size_t g_light_replay = 0;
+uint64_t g_lights_replayed = 0;
+
+void* __fastcall pop_light_detour() {
+    switch (g_light_mode.load()) {
+    case LightMode::record: {
+        void* item = g_pop_light();
+        if (item != nullptr) {
+            g_lights.push_back(item);
+        }
+        return item;
+    }
+    case LightMode::replay:
+        if (g_light_replay < g_lights.size()) {
+            ++g_lights_replayed;
+            void* item = g_lights[g_light_replay++];
+            *static_cast<void**>(item) = nullptr; // as the pop leaves it
+            return item;
+        }
+        return g_pop_light(); // anything pushed since (normally none)
+    default:
+        return g_pop_light();
+    }
+}
+
 // F10 node census: for one both-eyes frame the executor is replicated in both
 // passes, recording each node's callback and how many draws it produced, to find
 // the commands that behave differently the second time (the right pass draws
@@ -695,6 +732,8 @@ void __fastcall draw_job_detour(void* device) {
     QueryPerformanceCounter(&t0);
     hooks::context::set_write_observation(true);
     const auto left_before = read_counts();
+    g_lights.clear();
+    g_light_mode = LightMode::record;
     const bool census = g_census_armed;
     g_census_armed = false;
     if (census) {
@@ -702,6 +741,7 @@ void __fastcall draw_job_detour(void* device) {
     }
     g_draw_job(device);
     add_pass_counts(0, left_before, read_counts());
+    g_light_mode = LightMode::pass_through;
     hooks::context::set_write_observation(false);
     QueryPerformanceCounter(&t1);
     const uint64_t wait1 = hooks::context::read_map_ticks();
@@ -729,7 +769,10 @@ void __fastcall draw_job_detour(void* device) {
     if (census) {
         g_census_pass = 1;
     }
+    g_light_replay = 0;
+    g_light_mode = LightMode::replay;
     g_draw_job(device);
+    g_light_mode = LightMode::pass_through;
     g_census_pass = -1;
     if (census) {
         report_node_census();
@@ -793,6 +836,23 @@ bool install() {
                      (unsigned long long)(*executor - reinterpret_cast<uintptr_t>(exe)));
     } else {
         logger::warn("[stereo] render-queue executor not hooked; F10 node census unavailable");
+    }
+
+    // The light drain loop; its first call is the pop.
+    const auto drain = scan::find_pattern(text->start, text->size,
+                                          "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 E8 ?? ?? ?? ?? 48 85 C0 74 "
+                                          "?? 66 0F 1F 44 00 00 4C 8B C0 48 8B D3 48 8B CF FF 50 10 E8");
+    if (drain) {
+        const auto pop = reinterpret_cast<void*>(scan::resolve_rel32(*drain + 17));
+        if (MH_CreateHook(pop, reinterpret_cast<void*>(&pop_light_detour), reinterpret_cast<void**>(&g_pop_light)) ==
+                MH_OK &&
+            MH_EnableHook(pop) == MH_OK) {
+            logger::info("[stereo] light queue pop hooked at exe+0x%llx (drain loop exe+0x%llx)",
+                         (unsigned long long)(reinterpret_cast<uintptr_t>(pop) - reinterpret_cast<uintptr_t>(exe)),
+                         (unsigned long long)(*drain - reinterpret_cast<uintptr_t>(exe)));
+        }
+    } else {
+        logger::warn("[stereo] light queue not found; lights will only be drawn for the left eye");
     }
     return true;
 }
