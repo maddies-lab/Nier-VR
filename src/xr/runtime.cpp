@@ -131,6 +131,7 @@ std::mutex g_job_mutex;
 FrameViews g_job_views;
 bool g_job_enabled = false;
 std::atomic<uint64_t> g_both_rendered_sequence{0};
+std::atomic<bool> g_both_eyes_active{false};
 IDXGISwapChain* g_game_swapchain = nullptr;
 
 // Render thread: which pose goes with a presented image. The camera update runs
@@ -779,6 +780,7 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
         std::scoped_lock _{g_job_mutex};
         g_job_views = newest;
         g_job_enabled = g_presenting_projected;
+        g_both_eyes_active = g_presenting_projected && newest.both;
     }
 
     // Both eyes: the draw job already published the left image; the backbuffer holds
@@ -1072,6 +1074,10 @@ bool publish_from_job(const transport::FrameMeta& job_meta, uint64_t sequence) {
 
 void mark_both_rendered(uint64_t sequence) {
     g_both_rendered_sequence = sequence;
+}
+
+bool both_eyes_active() {
+    return g_both_eyes_active;
 }
 
 ID3D11DeviceContext* game_context() {

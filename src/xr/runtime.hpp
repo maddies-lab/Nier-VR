@@ -79,6 +79,8 @@ bool publish_from_job(const transport::FrameMeta& meta, uint64_t sequence);
 void mark_both_rendered(uint64_t sequence);
 
 ID3D11DeviceContext* game_context();
+// True while frames are presented in both-eyes mode (any thread).
+bool both_eyes_active();
 const char* stereo_mode_name(int mode);
 
 Status status();
