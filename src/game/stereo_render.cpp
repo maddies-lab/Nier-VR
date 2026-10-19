@@ -413,7 +413,10 @@ std::vector<Tracked> g_tracked;         // draw-job thread only
 std::vector<ID3D11Resource*> g_written; // this left pass (collected by the binding hooks)
 std::mutex g_written_mutex;
 uint64_t g_frame_index = 0;
-bool g_restore_enabled = true;          // F3 toggles (A/B test)
+// F3 toggles. Off by default: it never explained the per-eye differences (the light
+// queue did, see pop_light_detour) and it stalls eye adaptation (bright areas stay
+// overexposed after leaving a dark one).
+bool g_restore_enabled = false;
 bool g_restore_large = false;           // F2: also full-size render targets (previous-frame history)
 bool g_large_key_was_down = false;
 
