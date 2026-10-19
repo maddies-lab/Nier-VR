@@ -272,6 +272,53 @@ std::vector<ID3D11Resource*> g_written; // this left pass (collected by the bind
 std::mutex g_written_mutex;
 uint64_t g_frame_index = 0;
 bool g_restore_enabled = true;          // F3 toggles (A/B test)
+bool g_restore_large = false;           // F2: also full-size render targets (previous-frame history)
+bool g_large_key_was_down = false;
+
+// Per-pass call counts, compared between the passes (F4 test: should match).
+struct PassCounts {
+    uint64_t c[hooks::context::count_kinds]{};
+};
+PassCounts g_count_sum[2];
+uint32_t g_count_frames = 0, g_count_mismatches = 0;
+
+PassCounts read_counts() {
+    PassCounts p;
+    for (int i = 0; i < hooks::context::count_kinds; ++i) {
+        p.c[i] = hooks::context::counter(static_cast<hooks::context::Counter>(i));
+    }
+    return p;
+}
+
+void add_pass_counts(int pass, const PassCounts& before, const PassCounts& after) {
+    bool same = true;
+    static PassCounts left;
+    for (int i = 0; i < hooks::context::count_kinds; ++i) {
+        const uint64_t n = after.c[i] - before.c[i];
+        g_count_sum[pass].c[i] += n;
+        if (pass == 0) {
+            left.c[i] = n;
+        } else {
+            same = same && left.c[i] == n;
+        }
+    }
+    if (pass == 1) {
+        g_count_mismatches += same ? 0 : 1;
+        if (++g_count_frames == 300) {
+            const auto& l = g_count_sum[0].c;
+            const auto& r = g_count_sum[1].c;
+            logger::info("[stereo] per pass (avg of 300 frames, left | right): draws %.1f | %.1f, indirect draws "
+                         "%.1f | %.1f, dispatches %.1f | %.1f, predication %.1f | %.1f, queries %.1f | %.1f; "
+                         "%u frames with different counts",
+                         l[0] / 300.0, r[0] / 300.0, l[1] / 300.0, r[1] / 300.0, l[2] / 300.0, r[2] / 300.0,
+                         l[3] / 300.0, r[3] / 300.0, l[4] / 300.0, r[4] / 300.0, g_count_mismatches);
+            g_count_sum[0] = {};
+            g_count_sum[1] = {};
+            g_count_frames = 0;
+            g_count_mismatches = 0;
+        }
+    }
+}
 bool g_restore_key_was_down = false;
 
 // Bytes per pixel of the formats we care to size; others count as 8.
@@ -305,7 +352,7 @@ void on_write_views(ID3D11View* const* views, UINT count) {
             if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
                 D3D11_TEXTURE2D_DESC desc{};
                 static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-                keep = desc.Width * desc.Height <= k_small_target_pixels;
+                keep = g_restore_large || desc.Width * desc.Height <= k_small_target_pixels;
             }
         }
         if (keep && std::find(g_written.begin(), g_written.end(), resource) == g_written.end()) {
@@ -542,7 +589,9 @@ void __fastcall draw_job_detour(void* device) {
     uint64_t wait0 = hooks::context::read_map_ticks();
     QueryPerformanceCounter(&t0);
     hooks::context::set_write_observation(true);
+    const auto left_before = read_counts();
     g_draw_job(device);
+    add_pass_counts(0, left_before, read_counts());
     hooks::context::set_write_observation(false);
     QueryPerformanceCounter(&t1);
     const uint64_t wait1 = hooks::context::read_map_ticks();
@@ -566,7 +615,9 @@ void __fastcall draw_job_detour(void* device) {
     const uint64_t wait2 = hooks::context::read_map_ticks();
     LARGE_INTEGER t3;
     QueryPerformanceCounter(&t2);
+    const auto right_before = read_counts();
     g_draw_job(device);
+    add_pass_counts(1, right_before, read_counts());
     QueryPerformanceCounter(&t3);
     const uint64_t wait3 = hooks::context::read_map_ticks();
     if (timing) {
@@ -637,6 +688,14 @@ void on_present(ID3D11DeviceContext* context) {
         logger::info("[stereo] F3: per-pass GPU state restore %s", g_restore_enabled ? "on" : "off");
     }
     g_restore_key_was_down = restore_down;
+
+    const bool large_down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+    if (large_down && !g_large_key_was_down) {
+        g_restore_large = !g_restore_large;
+        logger::info("[stereo] F2: full-size render targets %s the per-pass restore",
+                     g_restore_large ? "included in" : "excluded from");
+    }
+    g_large_key_was_down = large_down;
 
     // The next frame's uploads start after this Present.
     std::scoped_lock _{g_uploads_mutex};

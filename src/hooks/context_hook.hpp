@@ -35,6 +35,18 @@ HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UIN
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped);
 void unmap_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource);
 
+// Calls counted on the context since start (both-eyes pass comparison).
+enum Counter {
+    count_draw,         // Draw, DrawIndexed, DrawInstanced, DrawIndexedInstanced
+    count_draw_indirect, // DrawInstancedIndirect, DrawIndexedInstancedIndirect
+    count_dispatch,     // Dispatch, DispatchIndirect
+    count_predication,  // SetPredication with a predicate
+    count_query_begin,
+    count_query_end,
+    count_kinds
+};
+uint64_t counter(Counter which);
+
 // Total QPC ticks the calling thread has spent inside Map(D3D11_MAP_READ*) calls
 // (CPU waiting for the GPU on read-backs).
 uint64_t read_map_ticks();

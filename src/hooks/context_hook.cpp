@@ -16,6 +16,69 @@ constexpr size_t k_unmap = 15;
 constexpr size_t k_om_set_render_targets = 33;
 constexpr size_t k_om_set_render_targets_and_uavs = 34;
 constexpr size_t k_cs_set_uavs = 68;
+constexpr size_t k_draw_indexed_instanced = 20;
+constexpr size_t k_draw_instanced = 21;
+constexpr size_t k_begin = 27;
+constexpr size_t k_end = 28;
+constexpr size_t k_set_predication = 30;
+constexpr size_t k_draw_indexed_instanced_indirect = 39;
+constexpr size_t k_draw_instanced_indirect = 40;
+constexpr size_t k_dispatch = 41;
+constexpr size_t k_dispatch_indirect = 42;
+
+std::atomic<uint64_t> g_counters[count_kinds];
+
+using DIIFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+using DIFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
+using AsyncFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Asynchronous*);
+using PredFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Predicate*, BOOL);
+using IndirectFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using DispatchFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT);
+DIIFn g_dii = nullptr;
+DIFn g_di = nullptr;
+AsyncFn g_begin = nullptr, g_end = nullptr;
+PredFn g_pred = nullptr;
+IndirectFn g_dii_indirect = nullptr, g_di_indirect = nullptr, g_dispatch_indirect = nullptr;
+DispatchFn g_dispatch = nullptr;
+
+void STDMETHODCALLTYPE dii(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
+    ++g_counters[count_draw];
+    g_dii(c, a, b, d, e, f);
+}
+void STDMETHODCALLTYPE di(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
+    ++g_counters[count_draw];
+    g_di(c, a, b, d, e);
+}
+void STDMETHODCALLTYPE begin(ID3D11DeviceContext* c, ID3D11Asynchronous* a) {
+    ++g_counters[count_query_begin];
+    g_begin(c, a);
+}
+void STDMETHODCALLTYPE end(ID3D11DeviceContext* c, ID3D11Asynchronous* a) {
+    ++g_counters[count_query_end];
+    g_end(c, a);
+}
+void STDMETHODCALLTYPE set_predication(ID3D11DeviceContext* c, ID3D11Predicate* p, BOOL v) {
+    if (p != nullptr) {
+        ++g_counters[count_predication];
+    }
+    g_pred(c, p, v);
+}
+void STDMETHODCALLTYPE dii_indirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    ++g_counters[count_draw_indirect];
+    g_dii_indirect(c, b, o);
+}
+void STDMETHODCALLTYPE di_indirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    ++g_counters[count_draw_indirect];
+    g_di_indirect(c, b, o);
+}
+void STDMETHODCALLTYPE dispatch(ID3D11DeviceContext* c, UINT x, UINT y, UINT z) {
+    ++g_counters[count_dispatch];
+    g_dispatch(c, x, y, z);
+}
+void STDMETHODCALLTYPE dispatch_indirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    ++g_counters[count_dispatch];
+    g_dispatch_indirect(c, b, o);
+}
 
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
@@ -57,11 +120,13 @@ void notify_draw(const char* kind) {
 }
 
 void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT start, INT base) {
+    ++g_counters[count_draw];
     notify_draw("DrawIndexed");
     g_draw_indexed(self, count, start, base);
 }
 
 void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
+    ++g_counters[count_draw];
     notify_draw("Draw");
     g_draw(self, count, start);
 }
@@ -147,12 +212,30 @@ bool install(ID3D11DeviceContext* context) {
         MH_CreateHook(vtable[k_om_set_render_targets_and_uavs], reinterpret_cast<void*>(&om_set_rt_uav),
                       reinterpret_cast<void**>(&g_om_set_rt_uav)) != MH_OK ||
         MH_CreateHook(vtable[k_cs_set_uavs], reinterpret_cast<void*>(&cs_set_uav),
-                      reinterpret_cast<void**>(&g_cs_set_uav)) != MH_OK) {
+                      reinterpret_cast<void**>(&g_cs_set_uav)) != MH_OK ||
+        MH_CreateHook(vtable[k_draw_indexed_instanced], reinterpret_cast<void*>(&dii),
+                      reinterpret_cast<void**>(&g_dii)) != MH_OK ||
+        MH_CreateHook(vtable[k_draw_instanced], reinterpret_cast<void*>(&di), reinterpret_cast<void**>(&g_di)) !=
+            MH_OK ||
+        MH_CreateHook(vtable[k_begin], reinterpret_cast<void*>(&begin), reinterpret_cast<void**>(&g_begin)) != MH_OK ||
+        MH_CreateHook(vtable[k_end], reinterpret_cast<void*>(&end), reinterpret_cast<void**>(&g_end)) != MH_OK ||
+        MH_CreateHook(vtable[k_set_predication], reinterpret_cast<void*>(&set_predication),
+                      reinterpret_cast<void**>(&g_pred)) != MH_OK ||
+        MH_CreateHook(vtable[k_draw_indexed_instanced_indirect], reinterpret_cast<void*>(&dii_indirect),
+                      reinterpret_cast<void**>(&g_dii_indirect)) != MH_OK ||
+        MH_CreateHook(vtable[k_draw_instanced_indirect], reinterpret_cast<void*>(&di_indirect),
+                      reinterpret_cast<void**>(&g_di_indirect)) != MH_OK ||
+        MH_CreateHook(vtable[k_dispatch], reinterpret_cast<void*>(&dispatch),
+                      reinterpret_cast<void**>(&g_dispatch)) != MH_OK ||
+        MH_CreateHook(vtable[k_dispatch_indirect], reinterpret_cast<void*>(&dispatch_indirect),
+                      reinterpret_cast<void**>(&g_dispatch_indirect)) != MH_OK) {
         logger::error("[context] could not hook the immediate context");
         return false;
     }
     for (const auto slot : {k_draw_indexed, k_draw, k_map, k_unmap, k_om_set_render_targets,
-                            k_om_set_render_targets_and_uavs, k_cs_set_uavs}) {
+                            k_om_set_render_targets_and_uavs, k_cs_set_uavs, k_draw_indexed_instanced,
+                            k_draw_instanced, k_begin, k_end, k_set_predication, k_draw_indexed_instanced_indirect,
+                            k_draw_instanced_indirect, k_dispatch, k_dispatch_indirect}) {
         MH_EnableHook(vtable[slot]);
     }
     g_installed = true;
@@ -179,6 +262,10 @@ void set_write_observation(bool enabled) {
 HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     return g_map(context, resource, subresource, type, flags, mapped);
+}
+
+uint64_t counter(Counter which) {
+    return g_counters[which];
 }
 
 uint64_t read_map_ticks() {
