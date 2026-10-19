@@ -20,6 +20,9 @@ struct Observer {
     // OMSetRenderTargetsAndUnorderedAccessViews, CSSetUnorderedAccessViews), while
     // write observation is enabled. Entries may be null.
     void (*on_write_views)(ID3D11View* const* views, UINT count) = nullptr;
+    // Called before every draw call while draw observation is enabled, with the
+    // call's arguments (unused ones 0).
+    void (*on_draw_detail)(ID3D11DeviceContext* context, int kind, const UINT (&args)[5]) = nullptr;
 };
 
 // Idempotent. Hooks the context's vtable functions on first call.
@@ -43,6 +46,8 @@ enum Counter {
     count_predication,  // SetPredication with a predicate
     count_query_begin,
     count_query_end,
+    count_update_subresource,
+    count_copy, // CopyResource, CopySubresourceRegion
     count_kinds
 };
 uint64_t counter(Counter which);

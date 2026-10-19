@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <mutex>
 #include <vector>
 
@@ -79,14 +81,104 @@ void* __fastcall pop_light_detour() {
 // passes, recording each node's callback and how many draws it produced, to find
 // the commands that behave differently the second time (the right pass draws
 // fewer calls than the left even with the same camera).
+std::atomic<int> g_census_pass{-1}; // -1 off, 0 left pass, 1 right pass
 struct NodeRecord {
     uintptr_t callback;
     uintptr_t argument;
     uint32_t key;
     uint32_t draws;
     uint32_t queries;
+    uint32_t updates; // UpdateSubresource
+    uint32_t copies;  // CopyResource / CopySubresourceRegion
 };
-std::atomic<int> g_census_pass{-1}; // -1 off, 0 left pass, 1 right pass
+
+// Everything a draw reads, as pointers/values, for comparing the two passes.
+enum FingerprintField {
+    fp_kind, fp_args0, fp_args1, fp_args2, fp_args3, fp_args4, fp_vs, fp_ps, fp_layout, fp_ib, fp_ib_offset,
+    fp_vb0, fp_vb_offset0, fp_vb1, fp_vb_offset1,
+    fp_vs_cb0, fp_ps_cb0 = fp_vs_cb0 + 8, fp_ps_srv0 = fp_ps_cb0 + 8, fp_rt0 = fp_ps_srv0 + 16, fp_fields
+};
+const char* field_name(int f) {
+    static char buffer[24];
+    if (f == fp_kind) return "draw kind";
+    if (f >= fp_args0 && f <= fp_args4) return "draw arguments";
+    if (f == fp_vs) return "vertex shader";
+    if (f == fp_ps) return "pixel shader";
+    if (f == fp_layout) return "input layout";
+    if (f == fp_ib || f == fp_ib_offset) return "index buffer/offset";
+    if (f >= fp_vb0 && f <= fp_vb_offset1) return "vertex buffer/offset";
+    if (f >= fp_vs_cb0 && f < fp_ps_cb0) {
+        std::snprintf(buffer, sizeof(buffer), "VS cbuffer b%d", f - fp_vs_cb0);
+        return buffer;
+    }
+    if (f >= fp_ps_cb0 && f < fp_ps_srv0) {
+        std::snprintf(buffer, sizeof(buffer), "PS cbuffer b%d", f - fp_ps_cb0);
+        return buffer;
+    }
+    if (f >= fp_ps_srv0 && f < fp_rt0) {
+        std::snprintf(buffer, sizeof(buffer), "PS texture t%d", f - fp_ps_srv0);
+        return buffer;
+    }
+    return "render target 0";
+}
+struct DrawPrint {
+    uint32_t node;
+    uintptr_t f[fp_fields];
+};
+std::vector<DrawPrint> g_census_draws[2];
+thread_local uint32_t t_census_node = 0;
+
+template <typename T>
+uintptr_t take(T* p) {
+    if (p != nullptr) {
+        p->Release();
+    }
+    return reinterpret_cast<uintptr_t>(p);
+}
+
+void on_draw_detail(ID3D11DeviceContext* c, int kind, const UINT (&args)[5]) {
+    const int pass = g_census_pass;
+    if (pass < 0 || g_census_draws[pass].size() > 20000) {
+        return;
+    }
+    DrawPrint d{t_census_node, {}};
+    d.f[fp_kind] = kind;
+    for (int i = 0; i < 5; ++i) d.f[fp_args0 + i] = args[i];
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    c->VSGetShader(&vs, nullptr, nullptr);
+    c->PSGetShader(&ps, nullptr, nullptr);
+    d.f[fp_vs] = take(vs);
+    d.f[fp_ps] = take(ps);
+    ID3D11InputLayout* layout = nullptr;
+    c->IAGetInputLayout(&layout);
+    d.f[fp_layout] = take(layout);
+    ID3D11Buffer* ib = nullptr;
+    DXGI_FORMAT ib_format{};
+    UINT ib_offset = 0;
+    c->IAGetIndexBuffer(&ib, &ib_format, &ib_offset);
+    d.f[fp_ib] = take(ib);
+    d.f[fp_ib_offset] = ib_offset;
+    ID3D11Buffer* vbs[2]{};
+    UINT strides[2]{}, offsets[2]{};
+    c->IAGetVertexBuffers(0, 2, vbs, strides, offsets);
+    d.f[fp_vb0] = take(vbs[0]);
+    d.f[fp_vb_offset0] = offsets[0];
+    d.f[fp_vb1] = take(vbs[1]);
+    d.f[fp_vb_offset1] = offsets[1];
+    ID3D11Buffer* cbs[8]{};
+    c->VSGetConstantBuffers(0, 8, cbs);
+    for (int i = 0; i < 8; ++i) d.f[fp_vs_cb0 + i] = take(cbs[i]);
+    c->PSGetConstantBuffers(0, 8, cbs);
+    for (int i = 0; i < 8; ++i) d.f[fp_ps_cb0 + i] = take(cbs[i]);
+    ID3D11ShaderResourceView* srvs[16]{};
+    c->PSGetShaderResources(0, 16, srvs);
+    for (int i = 0; i < 16; ++i) d.f[fp_ps_srv0 + i] = take(srvs[i]);
+    ID3D11RenderTargetView* rt = nullptr;
+    c->OMGetRenderTargets(1, &rt, nullptr);
+    d.f[fp_rt0] = take(rt);
+    g_census_draws[pass].push_back(d);
+}
 bool g_census_armed = false, g_census_key_was_down = false;
 std::vector<NodeRecord> g_census_nodes[2];
 
@@ -110,13 +202,18 @@ void __fastcall execute_detour(void* queue, void* device) {
                 uint8_t b0, b1, pad[2];
                 uint32_t low;
             } key{static_cast<uint8_t>(sort >> 30), static_cast<uint8_t>((sort >> 23) & 0x7F), {0, 0}, sort & 0xFFFFF};
-            const auto draws_before = hooks::context::counter(hooks::context::count_draw);
-            const auto queries_before = hooks::context::counter(hooks::context::count_query_begin);
+            using hooks::context::counter;
+            const auto draws_before = counter(hooks::context::count_draw);
+            const auto queries_before = counter(hooks::context::count_query_begin);
+            const auto updates_before = counter(hooks::context::count_update_subresource);
+            const auto copies_before = counter(hooks::context::count_copy);
+            t_census_node = static_cast<uint32_t>(records.size());
             reinterpret_cast<CommandFn>(node[0])(device, &key, reinterpret_cast<void*>(node[1]));
             records.push_back({node[0], node[1], sort,
-                               static_cast<uint32_t>(hooks::context::counter(hooks::context::count_draw) - draws_before),
-                               static_cast<uint32_t>(hooks::context::counter(hooks::context::count_query_begin) -
-                                                     queries_before)});
+                               static_cast<uint32_t>(counter(hooks::context::count_draw) - draws_before),
+                               static_cast<uint32_t>(counter(hooks::context::count_query_begin) - queries_before),
+                               static_cast<uint32_t>(counter(hooks::context::count_update_subresource) - updates_before),
+                               static_cast<uint32_t>(counter(hooks::context::count_copy) - copies_before)});
         }
         node = next;
     }
@@ -134,7 +231,7 @@ void report_node_census() {
 
     // Draws per callback in each pass, and the callbacks that differ.
     struct PerCallback {
-        uint64_t calls[2]{}, draws[2]{}, queries[2]{};
+        uint64_t calls[2]{}, draws[2]{}, queries[2]{}, updates[2]{}, copies[2]{};
     };
     std::vector<std::pair<uintptr_t, PerCallback>> per;
     auto add = [&](int pass, const NodeRecord& n) {
@@ -146,15 +243,24 @@ void report_node_census() {
         ++it->second.calls[pass];
         it->second.draws[pass] += n.draws;
         it->second.queries[pass] += n.queries;
+        it->second.updates[pass] += n.updates;
+        it->second.copies[pass] += n.copies;
     };
     for (const auto& n : l) add(0, n);
     for (const auto& n : r) add(1, n);
     for (const auto& [callback, c] : per) {
-        const bool differs = c.calls[0] != c.calls[1] || c.draws[0] != c.draws[1] || c.queries[0] != c.queries[1];
-        logger::info("[nodes] %s callback exe+0x%llx: commands %llu | %llu, draws %llu | %llu, queries %llu | %llu",
+        const bool differs = c.calls[0] != c.calls[1] || c.draws[0] != c.draws[1] || c.queries[0] != c.queries[1] ||
+                             c.updates[0] != c.updates[1] || c.copies[0] != c.copies[1];
+        if (!differs && c.updates[0] == 0 && c.copies[0] == 0) {
+            continue; // keep the log short: only differing or copy/update commands
+        }
+        logger::info("[nodes] %s callback exe+0x%llx: commands %llu | %llu, draws %llu | %llu, queries %llu | %llu, "
+                     "updates %llu | %llu, copies %llu | %llu",
                      differs ? "DIFFERS" : "same   ", (unsigned long long)(callback - exe),
                      (unsigned long long)c.calls[0], (unsigned long long)c.calls[1], (unsigned long long)c.draws[0],
-                     (unsigned long long)c.draws[1], (unsigned long long)c.queries[0], (unsigned long long)c.queries[1]);
+                     (unsigned long long)c.draws[1], (unsigned long long)c.queries[0], (unsigned long long)c.queries[1],
+                     (unsigned long long)c.updates[0], (unsigned long long)c.updates[1],
+                     (unsigned long long)c.copies[0], (unsigned long long)c.copies[1]);
     }
     // The first individual commands that differ, in order.
     int shown = 0;
@@ -168,6 +274,31 @@ void report_node_census() {
             ++shown;
         }
     }
+    // Draws whose inputs differ between the passes (same camera with F4).
+    const auto& dl = g_census_draws[0];
+    const auto& dr = g_census_draws[1];
+    logger::info("[nodes] draw fingerprints: %zu | %zu", dl.size(), dr.size());
+    int reported = 0;
+    for (size_t i = 0; i < std::min(dl.size(), dr.size()) && reported < 60; ++i) {
+        std::string fields;
+        for (int f = 0; f < fp_fields; ++f) {
+            if (dl[i].f[f] != dr[i].f[f] && f != fp_vs_cb0 + 0 /* SceneBuffer re-upload is expected */) {
+                const char* name = field_name(f);
+                if (fields.find(name) == std::string::npos) {
+                    fields += fields.empty() ? "" : ", ";
+                    fields += name;
+                }
+            }
+        }
+        if (!fields.empty()) {
+            const auto node = dl[i].node < l.size() ? l[dl[i].node].callback - exe : 0;
+            logger::info("[nodes] draw #%zu (command #%u, callback exe+0x%llx, ps %llx): differs in %s", i,
+                         dl[i].node, (unsigned long long)node, (unsigned long long)dl[i].f[fp_ps], fields.c_str());
+            ++reported;
+        }
+    }
+    g_census_draws[0].clear();
+    g_census_draws[1].clear();
     g_census_nodes[0].clear();
     g_census_nodes[1].clear();
 }
@@ -741,6 +872,7 @@ void __fastcall draw_job_detour(void* device) {
     g_census_armed = false;
     if (census) {
         g_census_pass = 0;
+        hooks::context::set_draw_observation(true);
     }
     g_draw_job(device);
     add_pass_counts(0, left_before, read_counts());
@@ -778,6 +910,7 @@ void __fastcall draw_job_detour(void* device) {
     g_light_mode = LightMode::pass_through;
     g_census_pass = -1;
     if (census) {
+        hooks::context::set_draw_observation(false);
         report_node_census();
     }
     add_pass_counts(1, right_before, read_counts());
@@ -862,7 +995,7 @@ bool install() {
 
 void on_present(ID3D11DeviceContext* context) {
     if (!g_registered && context != nullptr && hooks::context::install(context)) {
-        hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views});
+        hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views, on_draw_detail});
         g_registered = true;
     }
     const bool test_down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;

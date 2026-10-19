@@ -2,38 +2,63 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "game/camera.hpp"
 #include "log.hpp"
 
 namespace game {
 namespace {
-void dump_rows(const char* label, const void* base, size_t size) {
-    const auto bytes = static_cast<const uint8_t*>(base);
-    for (size_t offset = 0; offset < size; offset += 16) {
-        float f[4];
-        uint64_t q[2];
-        std::memcpy(f, bytes + offset, sizeof(f));
-        std::memcpy(q, bytes + offset, sizeof(q));
-        logger::info("[snap] %s+%03zx  %12.4f %12.4f %12.4f %12.4f   %016llx %016llx", label, offset, f[0], f[1], f[2],
-                     f[3], (unsigned long long)q[0], (unsigned long long)q[1]);
+constexpr size_t k_camera_size = 0x8C20;
+constexpr size_t k_data_size = 0x2A0;
+
+struct Snapshot {
+    std::vector<uint8_t> camera, data;
+};
+std::vector<Snapshot> g_snapshots;
+
+// 32-bit fields equal in the first two snapshots (taken during normal play) that
+// differ in the third (taken on the screen to tell apart).
+void report(const char* label, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
+            const std::vector<uint8_t>& c) {
+    int shown = 0;
+    for (size_t offset = 0; offset + 4 <= a.size() && shown < 150; offset += 4) {
+        uint32_t x, y, z;
+        std::memcpy(&x, &a[offset], 4);
+        std::memcpy(&y, &b[offset], 4);
+        std::memcpy(&z, &c[offset], 4);
+        if (x == y && y != z) {
+            float fy, fz;
+            std::memcpy(&fy, &y, 4);
+            std::memcpy(&fz, &z, 4);
+            logger::info("[snap] %s+0x%04zx: %08x -> %08x  (int %d -> %d, float %.4g -> %.4g)", label, offset, y, z,
+                         (int)y, (int)z, fy, fz);
+            ++shown;
+        }
     }
+    logger::info("[snap] %s: %d candidate fields%s", label, shown, shown == 150 ? " (truncated)" : "");
 }
 } // namespace
 
 void log_camera_snapshot() {
-    static int index = 0;
     const auto camera = CameraGame::get();
-    if (camera == nullptr || !camera->valid()) {
+    if (camera == nullptr || !camera->valid() || camera->data() == nullptr) {
         logger::warn("[snap] no valid cCameraGame");
         return;
     }
 
-    logger::info("[snap] ---- snapshot %d: cCameraGame %p, CameraData %p", ++index, (void*)camera,
-                 (void*)camera->data());
-    dump_rows("cam", camera, 0x400);
-    if (camera->data() != nullptr) {
-        dump_rows("data", camera->data(), 0x400);
+    const auto cam = reinterpret_cast<const uint8_t*>(camera);
+    const auto data = reinterpret_cast<const uint8_t*>(camera->data());
+    g_snapshots.push_back({std::vector<uint8_t>(cam, cam + k_camera_size),
+                           std::vector<uint8_t>(data, data + k_data_size)});
+    logger::info("[snap] snapshot %zu of 3 taken%s", g_snapshots.size(),
+                 g_snapshots.size() < 3 ? " (1 and 2 in normal play, 3 on the screen to identify)" : "");
+    if (g_snapshots.size() < 3) {
+        return;
     }
+
+    report("cCameraGame", g_snapshots[0].camera, g_snapshots[1].camera, g_snapshots[2].camera);
+    report("CameraData", g_snapshots[0].data, g_snapshots[1].data, g_snapshots[2].data);
+    g_snapshots.clear();
 }
 } // namespace game

@@ -25,6 +25,9 @@ constexpr size_t k_draw_indexed_instanced_indirect = 39;
 constexpr size_t k_draw_instanced_indirect = 40;
 constexpr size_t k_dispatch = 41;
 constexpr size_t k_dispatch_indirect = 42;
+constexpr size_t k_copy_subresource_region = 46;
+constexpr size_t k_copy_resource = 47;
+constexpr size_t k_update_subresource = 48;
 
 std::atomic<uint64_t> g_counters[count_kinds];
 
@@ -40,13 +43,40 @@ AsyncFn g_begin = nullptr, g_end = nullptr;
 PredFn g_pred = nullptr;
 IndirectFn g_dii_indirect = nullptr, g_di_indirect = nullptr, g_dispatch_indirect = nullptr;
 DispatchFn g_dispatch = nullptr;
+using CopyRegionFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT,
+                                              ID3D11Resource*, UINT, const D3D11_BOX*);
+using CopyFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+using UpdateFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
+                                          const void*, UINT, UINT);
+CopyRegionFn g_copy_region = nullptr;
+CopyFn g_copy = nullptr;
+UpdateFn g_update = nullptr;
+
+void notify_draw_detail(ID3D11DeviceContext* c, int kind, UINT a, UINT b, UINT d, UINT e, UINT f);
+
+void STDMETHODCALLTYPE copy_region(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x, UINT y, UINT z,
+                                   ID3D11Resource* src, UINT ss, const D3D11_BOX* box) {
+    ++g_counters[count_copy];
+    g_copy_region(c, dst, ds, x, y, z, src, ss, box);
+}
+void STDMETHODCALLTYPE copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src) {
+    ++g_counters[count_copy];
+    g_copy(c, dst, src);
+}
+void STDMETHODCALLTYPE update(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, const D3D11_BOX* box,
+                              const void* data, UINT pitch, UINT depth_pitch) {
+    ++g_counters[count_update_subresource];
+    g_update(c, dst, ds, box, data, pitch, depth_pitch);
+}
 
 void STDMETHODCALLTYPE dii(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
     ++g_counters[count_draw];
+    notify_draw_detail(c, 2, a, b, d, static_cast<UINT>(e), f);
     g_dii(c, a, b, d, e, f);
 }
 void STDMETHODCALLTYPE di(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
     ++g_counters[count_draw];
+    notify_draw_detail(c, 3, a, b, d, e, 0);
     g_di(c, a, b, d, e);
 }
 void STDMETHODCALLTYPE begin(ID3D11DeviceContext* c, ID3D11Asynchronous* a) {
@@ -119,14 +149,28 @@ void notify_draw(const char* kind) {
     }
 }
 
+void notify_draw_detail(ID3D11DeviceContext* c, int kind, UINT a, UINT b, UINT d, UINT e, UINT f) {
+    if (!g_observe_draws) {
+        return;
+    }
+    const UINT args[5] = {a, b, d, e, f};
+    for (int i = 0; i < g_observer_count; ++i) {
+        if (g_observers[i].on_draw_detail) {
+            g_observers[i].on_draw_detail(c, kind, args);
+        }
+    }
+}
+
 void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT start, INT base) {
     ++g_counters[count_draw];
+    notify_draw_detail(self, 0, count, start, static_cast<UINT>(base), 0, 0);
     notify_draw("DrawIndexed");
     g_draw_indexed(self, count, start, base);
 }
 
 void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
     ++g_counters[count_draw];
+    notify_draw_detail(self, 1, count, start, 0, 0, 0);
     notify_draw("Draw");
     g_draw(self, count, start);
 }
@@ -228,14 +272,21 @@ bool install(ID3D11DeviceContext* context) {
         MH_CreateHook(vtable[k_dispatch], reinterpret_cast<void*>(&dispatch),
                       reinterpret_cast<void**>(&g_dispatch)) != MH_OK ||
         MH_CreateHook(vtable[k_dispatch_indirect], reinterpret_cast<void*>(&dispatch_indirect),
-                      reinterpret_cast<void**>(&g_dispatch_indirect)) != MH_OK) {
+                      reinterpret_cast<void**>(&g_dispatch_indirect)) != MH_OK ||
+        MH_CreateHook(vtable[k_copy_subresource_region], reinterpret_cast<void*>(&copy_region),
+                      reinterpret_cast<void**>(&g_copy_region)) != MH_OK ||
+        MH_CreateHook(vtable[k_copy_resource], reinterpret_cast<void*>(&copy), reinterpret_cast<void**>(&g_copy)) !=
+            MH_OK ||
+        MH_CreateHook(vtable[k_update_subresource], reinterpret_cast<void*>(&update),
+                      reinterpret_cast<void**>(&g_update)) != MH_OK) {
         logger::error("[context] could not hook the immediate context");
         return false;
     }
     for (const auto slot : {k_draw_indexed, k_draw, k_map, k_unmap, k_om_set_render_targets,
                             k_om_set_render_targets_and_uavs, k_cs_set_uavs, k_draw_indexed_instanced,
                             k_draw_instanced, k_begin, k_end, k_set_predication, k_draw_indexed_instanced_indirect,
-                            k_draw_instanced_indirect, k_dispatch, k_dispatch_indirect}) {
+                            k_draw_instanced_indirect, k_dispatch, k_dispatch_indirect, k_copy_subresource_region,
+                            k_copy_resource, k_update_subresource}) {
         MH_EnableHook(vtable[slot]);
     }
     g_installed = true;
