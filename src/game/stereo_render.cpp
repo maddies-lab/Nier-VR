@@ -30,6 +30,111 @@ constexpr UINT k_max_scanned_buffer = 256;
 using DrawJobFn = void(__fastcall*)(void* device);
 DrawJobFn g_draw_job = nullptr;
 
+// The render-queue executor the draw job calls (exe+0x247D20 in the Compat build):
+// walks the queue's command list and calls each node's callback.
+//   node: +0x00 callback, +0x08 argument, +0x18 next, +0x20 sort key
+//   callback(device, &key_bytes, argument)
+using ExecuteFn = void(__fastcall*)(void* queue, void* device);
+ExecuteFn g_execute = nullptr;
+using CommandFn = void(__fastcall*)(void* device, void* key, void* argument);
+
+// F10 node census: for one both-eyes frame the executor is replicated in both
+// passes, recording each node's callback and how many draws it produced, to find
+// the commands that behave differently the second time (the right pass draws
+// fewer calls than the left even with the same camera).
+struct NodeRecord {
+    uintptr_t callback;
+    uintptr_t argument;
+    uint32_t key;
+    uint32_t draws;
+    uint32_t queries;
+};
+std::atomic<int> g_census_pass{-1}; // -1 off, 0 left pass, 1 right pass
+bool g_census_armed = false, g_census_key_was_down = false;
+std::vector<NodeRecord> g_census_nodes[2];
+
+void __fastcall execute_detour(void* queue, void* device) {
+    const int pass = g_census_pass;
+    if (pass < 0) {
+        g_execute(queue, device);
+        return;
+    }
+    auto& records = g_census_nodes[pass];
+    const auto q = static_cast<uint8_t*>(queue);
+    if (*reinterpret_cast<int*>(q + 0xA4) == 0) {
+        return;
+    }
+    auto node = *reinterpret_cast<uintptr_t**>(q + 0x68);
+    while (node != nullptr) {
+        const auto next = reinterpret_cast<uintptr_t*>(node[3]);
+        if (node[0] != 0) {
+            const uint32_t sort = static_cast<uint32_t>(node[4]);
+            struct {
+                uint8_t b0, b1, pad[2];
+                uint32_t low;
+            } key{static_cast<uint8_t>(sort >> 30), static_cast<uint8_t>((sort >> 23) & 0x7F), {0, 0}, sort & 0xFFFFF};
+            const auto draws_before = hooks::context::counter(hooks::context::count_draw);
+            const auto queries_before = hooks::context::counter(hooks::context::count_query_begin);
+            reinterpret_cast<CommandFn>(node[0])(device, &key, reinterpret_cast<void*>(node[1]));
+            records.push_back({node[0], node[1], sort,
+                               static_cast<uint32_t>(hooks::context::counter(hooks::context::count_draw) - draws_before),
+                               static_cast<uint32_t>(hooks::context::counter(hooks::context::count_query_begin) -
+                                                     queries_before)});
+        }
+        node = next;
+    }
+}
+
+void report_node_census() {
+    const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto& l = g_census_nodes[0];
+    const auto& r = g_census_nodes[1];
+    uint64_t ld = 0, rd = 0;
+    for (const auto& n : l) ld += n.draws;
+    for (const auto& n : r) rd += n.draws;
+    logger::info("[nodes] left pass: %zu commands, %llu draws; right pass: %zu commands, %llu draws", l.size(),
+                 (unsigned long long)ld, r.size(), (unsigned long long)rd);
+
+    // Draws per callback in each pass, and the callbacks that differ.
+    struct PerCallback {
+        uint64_t calls[2]{}, draws[2]{}, queries[2]{};
+    };
+    std::vector<std::pair<uintptr_t, PerCallback>> per;
+    auto add = [&](int pass, const NodeRecord& n) {
+        auto it = std::find_if(per.begin(), per.end(), [&](const auto& e) { return e.first == n.callback; });
+        if (it == per.end()) {
+            per.push_back({n.callback, {}});
+            it = per.end() - 1;
+        }
+        ++it->second.calls[pass];
+        it->second.draws[pass] += n.draws;
+        it->second.queries[pass] += n.queries;
+    };
+    for (const auto& n : l) add(0, n);
+    for (const auto& n : r) add(1, n);
+    for (const auto& [callback, c] : per) {
+        const bool differs = c.calls[0] != c.calls[1] || c.draws[0] != c.draws[1] || c.queries[0] != c.queries[1];
+        logger::info("[nodes] %s callback exe+0x%llx: commands %llu | %llu, draws %llu | %llu, queries %llu | %llu",
+                     differs ? "DIFFERS" : "same   ", (unsigned long long)(callback - exe),
+                     (unsigned long long)c.calls[0], (unsigned long long)c.calls[1], (unsigned long long)c.draws[0],
+                     (unsigned long long)c.draws[1], (unsigned long long)c.queries[0], (unsigned long long)c.queries[1]);
+    }
+    // The first individual commands that differ, in order.
+    int shown = 0;
+    for (size_t i = 0; i < std::min(l.size(), r.size()) && shown < 40; ++i) {
+        if (l[i].callback != r[i].callback || l[i].argument != r[i].argument || l[i].draws != r[i].draws) {
+            logger::info("[nodes] #%zu left exe+0x%llx arg %llx key %08x draws %u | right exe+0x%llx arg %llx key %08x "
+                         "draws %u",
+                         i, (unsigned long long)(l[i].callback - exe), (unsigned long long)l[i].argument, l[i].key,
+                         l[i].draws, (unsigned long long)(r[i].callback - exe), (unsigned long long)r[i].argument,
+                         r[i].key, r[i].draws);
+            ++shown;
+        }
+    }
+    g_census_nodes[0].clear();
+    g_census_nodes[1].clear();
+}
+
 // Constant-buffer uploads that carry the main camera, found by content while the
 // main thread uploads the frame (before the draw job): the main SceneBuffer
 // (view, projection, view*projection, camera-to-world), the buffer holding the
@@ -590,6 +695,11 @@ void __fastcall draw_job_detour(void* device) {
     QueryPerformanceCounter(&t0);
     hooks::context::set_write_observation(true);
     const auto left_before = read_counts();
+    const bool census = g_census_armed;
+    g_census_armed = false;
+    if (census) {
+        g_census_pass = 0;
+    }
     g_draw_job(device);
     add_pass_counts(0, left_before, read_counts());
     hooks::context::set_write_observation(false);
@@ -616,7 +726,14 @@ void __fastcall draw_job_detour(void* device) {
     LARGE_INTEGER t3;
     QueryPerformanceCounter(&t2);
     const auto right_before = read_counts();
+    if (census) {
+        g_census_pass = 1;
+    }
     g_draw_job(device);
+    g_census_pass = -1;
+    if (census) {
+        report_node_census();
+    }
     add_pass_counts(1, right_before, read_counts());
     QueryPerformanceCounter(&t3);
     const uint64_t wait3 = hooks::context::read_map_ticks();
@@ -665,6 +782,18 @@ bool install() {
     }
     logger::info("[stereo] draw job hooked at exe+0x%llx",
                  (unsigned long long)(*target - reinterpret_cast<uintptr_t>(exe)));
+
+    const auto executor = scan::find_pattern(
+        text->start, text->size,
+        "40 55 48 83 EC 20 83 B9 A4 00 00 00 00 48 8B EA 0F 84 ?? ?? ?? ?? 48 89 5C 24 38 48 8B 59 68");
+    if (executor && MH_CreateHook(reinterpret_cast<void*>(*executor), reinterpret_cast<void*>(&execute_detour),
+                                  reinterpret_cast<void**>(&g_execute)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(*executor)) == MH_OK) {
+        logger::info("[stereo] render-queue executor hooked at exe+0x%llx",
+                     (unsigned long long)(*executor - reinterpret_cast<uintptr_t>(exe)));
+    } else {
+        logger::warn("[stereo] render-queue executor not hooked; F10 node census unavailable");
+    }
     return true;
 }
 
@@ -696,6 +825,13 @@ void on_present(ID3D11DeviceContext* context) {
                      g_restore_large ? "included in" : "excluded from");
     }
     g_large_key_was_down = large_down;
+
+    const bool census_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (census_down && !g_census_key_was_down) {
+        g_census_armed = true;
+        logger::info("[nodes] F10: recording the next both-eyes frame's render commands");
+    }
+    g_census_key_was_down = census_down;
 
     // The next frame's uploads start after this Present.
     std::scoped_lock _{g_uploads_mutex};

@@ -19,7 +19,6 @@ bool g_initialized = false;
 bool g_visible = true;
 bool g_toggle_was_down = false;
 bool g_snapshot_was_down = false;
-bool g_watch_was_down = false;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
@@ -80,7 +79,7 @@ void draw_window(IDXGISwapChain* swapchain) {
     ImGui::SetNextWindowPos(ImVec2{16, 16}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
     ImGui::Begin("NieR-VR  M1", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("Insert: overlay  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9/F10: RE");
+    ImGui::Text("Insert: overlay  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9-F11: RE");
     ImGui::Separator();
     ImGui::Text("Build: %s (stamp 0x%08X)", g_build.name != nullptr ? g_build.name : "UNKNOWN", g_build.timestamp);
     ImGui::Text("Backbuffer: %u x %u, format %d, frame %llu", desc.BufferDesc.Width, desc.BufferDesc.Height,
@@ -152,11 +151,6 @@ void on_present(IDXGISwapChain* swapchain) {
     }
     g_snapshot_was_down = snapshot_down;
 
-    const bool watch_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (watch_down && !g_watch_was_down) {
-        game::watch::start_camera_watch();
-    }
-    g_watch_was_down = watch_down;
 
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
