@@ -47,7 +47,11 @@ struct Upload {
 };
 
 std::mutex g_uploads_mutex;
-std::vector<Upload> g_uploads; // this frame's camera uploads (cleared at Present)
+std::vector<Upload> g_uploads; // this frame's camera uploads, one per buffer (cleared at Present)
+constexpr size_t k_max_camera_uploads = 32;
+
+// Cost diagnostics (per frame, logged every 300 frames).
+uint64_t g_scan_ticks = 0, g_scanned = 0, g_matched = 0, g_patch_ticks = 0, g_frames = 0, g_over_cap = 0;
 
 struct PendingMap {
     ID3D11Resource* resource = nullptr;
@@ -139,10 +143,16 @@ void on_unmap(ID3D11Resource* resource) {
     const auto pending = t_pending;
     t_pending = {};
 
+    LARGE_INTEGER before, after;
+    QueryPerformanceCounter(&before);
     auto fields = find_camera_fields(reinterpret_cast<const float*>(pending.data), pending.size);
+    QueryPerformanceCounter(&after);
+    g_scan_ticks += after.QuadPart - before.QuadPart;
+    ++g_scanned;
     if (fields.empty()) {
         return;
     }
+    ++g_matched;
     for (const auto& field : fields) {
         const uint64_t key = (uint64_t(pending.size) << 32) | (uint64_t(field.offset) << 8) | uint64_t(field.what);
         if (std::find(g_seen_fields.begin(), g_seen_fields.end(), key) == g_seen_fields.end() &&
@@ -155,6 +165,13 @@ void on_unmap(ID3D11Resource* resource) {
 
     Upload upload{resource, std::vector<uint8_t>(pending.data, pending.data + pending.size), std::move(fields)};
     std::scoped_lock _{g_uploads_mutex};
+    // Draws only ever see a buffer's last upload of the frame.
+    for (auto& existing : g_uploads) {
+        if (existing.resource == resource) {
+            existing = std::move(upload);
+            return;
+        }
+    }
     g_uploads.push_back(std::move(upload));
 }
 
@@ -177,6 +194,14 @@ bool upload_right_eye(ID3D11DeviceContext* context, const float (&scene)[64]) {
     if (g_uploads.empty()) {
         return false;
     }
+    if (g_uploads.size() > k_max_camera_uploads) {
+        if (g_over_cap++ == 0) {
+            logger::warn("[stereo] %zu camera uploads in one frame; drawing one eye for such frames", g_uploads.size());
+        }
+        return false;
+    }
+    LARGE_INTEGER before, after;
+    QueryPerformanceCounter(&before);
     for (const auto& upload : g_uploads) {
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(hooks::context::map_original(context, upload.resource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -199,6 +224,9 @@ bool upload_right_eye(ID3D11DeviceContext* context, const float (&scene)[64]) {
         }
         hooks::context::unmap_original(context, upload.resource, 0);
     }
+
+    QueryPerformanceCounter(&after);
+    g_patch_ticks += after.QuadPart - before.QuadPart;
 
     std::memcpy(g_previous_right_view_projection, right[1], sizeof(right[1]));
     g_have_previous_right = true;
@@ -406,6 +434,15 @@ void on_present(ID3D11DeviceContext* context) {
     }
     // The next frame's uploads start after this Present.
     std::scoped_lock _{g_uploads_mutex};
+    if (!g_uploads.empty() && ++g_frames % 300 == 0) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        const double ms = 1000.0 / frequency.QuadPart / 300.0;
+        logger::info("[stereo] camera uploads per frame: %.1f buffers scanned (%.2f ms), %.1f matched, %zu kept, "
+                     "right-eye re-upload %.2f ms",
+                     g_scanned / 300.0, g_scan_ticks * ms, g_matched / 300.0, g_uploads.size(), g_patch_ticks * ms);
+        g_scanned = g_matched = g_scan_ticks = g_patch_ticks = 0;
+    }
     g_uploads.clear();
 }
 } // namespace game::stereo_render
