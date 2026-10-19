@@ -19,7 +19,13 @@
 
 namespace game::stereo_render {
 namespace {
-constexpr UINT k_max_scanned_buffer = 1024;
+// Sizes of the constant buffers found carrying the main camera (F11 census): the
+// main SceneBuffer (256), previous view*projection (80) and camera position (32).
+// Only these are scanned: the game maps ~2000 constant buffers per frame, and
+// reading mapped upload memory from the CPU is slow (write-combined), so a scan of
+// all of them cost ~500 ms per frame.
+constexpr UINT k_scanned_sizes[] = {32, 80, 256};
+constexpr UINT k_max_scanned_buffer = 256;
 
 using DrawJobFn = void(__fastcall*)(void* device);
 DrawJobFn g_draw_job = nullptr;
@@ -130,7 +136,8 @@ void on_map(ID3D11Resource* resource, D3D11_MAP type, const D3D11_MAPPED_SUBRESO
     }
     D3D11_BUFFER_DESC desc{};
     static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
-    if (desc.ByteWidth >= 12 && desc.ByteWidth <= k_max_scanned_buffer &&
+    if (std::find(std::begin(k_scanned_sizes), std::end(k_scanned_sizes), desc.ByteWidth) !=
+            std::end(k_scanned_sizes) &&
         (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0) {
         t_pending = {resource, static_cast<const uint8_t*>(mapped->pData), desc.ByteWidth};
     }
@@ -145,7 +152,10 @@ void on_unmap(ID3D11Resource* resource) {
 
     LARGE_INTEGER before, after;
     QueryPerformanceCounter(&before);
-    auto fields = find_camera_fields(reinterpret_cast<const float*>(pending.data), pending.size);
+    // One sequential read of the mapped memory; the scan works on the copy.
+    alignas(16) uint8_t local[k_max_scanned_buffer];
+    std::memcpy(local, pending.data, pending.size);
+    auto fields = find_camera_fields(reinterpret_cast<const float*>(local), pending.size);
     QueryPerformanceCounter(&after);
     g_scan_ticks += after.QuadPart - before.QuadPart;
     ++g_scanned;
@@ -163,7 +173,7 @@ void on_unmap(ID3D11Resource* resource) {
         }
     }
 
-    Upload upload{resource, std::vector<uint8_t>(pending.data, pending.data + pending.size), std::move(fields)};
+    Upload upload{resource, std::vector<uint8_t>(local, local + pending.size), std::move(fields)};
     std::scoped_lock _{g_uploads_mutex};
     // Draws only ever see a buffer's last upload of the frame.
     for (auto& existing : g_uploads) {
