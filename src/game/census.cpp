@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -43,6 +44,7 @@ struct PendingMap {
 };
 thread_local PendingMap t_pending;
 int g_dumps = 0;
+int g_structured_dumps = 0;
 
 void record(const char* kind) {
     uintptr_t frames[k_depth];
@@ -78,15 +80,42 @@ void on_map(ID3D11Resource* resource, D3D11_MAP type, const D3D11_MAPPED_SUBRESO
     D3D11_RESOURCE_DIMENSION dimension{};
     resource->GetType(&dimension);
     UINT size = 0;
+    D3D11_BUFFER_DESC desc{};
     if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-        D3D11_BUFFER_DESC desc{};
         static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
         size = desc.ByteWidth;
     }
-    char kind[48];
-    std::snprintf(kind, sizeof(kind), "Map[%s %u t%d]", dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? "buf" : "tex",
-                  size, (int)type);
+    char kind[80];
+    if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0) {
+        std::snprintf(kind, sizeof(kind), "Map[structured %u stride %u bind 0x%x t%d]", size,
+                      desc.StructureByteStride, desc.BindFlags, (int)type);
+    } else {
+        std::snprintf(kind, sizeof(kind), "Map[%s %u bind 0x%x t%d]",
+                      dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? "buf" : "tex", size, desc.BindFlags, (int)type);
+    }
     record(kind);
+
+    // Light (48-byte) and probe (96-byte) arrays: dump the first elements so their
+    // layout can be checked against the camera (both-eyes lighting).
+    if (SUCCEEDED(hr) && (desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0 &&
+        (desc.StructureByteStride == 48 || desc.StructureByteStride == 96) && g_structured_dumps < 6) {
+        ++g_structured_dumps;
+        float local[6 * 24];
+        const UINT elements = std::min<UINT>(6, size / desc.StructureByteStride);
+        std::memcpy(local, mapped->pData, elements * desc.StructureByteStride);
+        const UINT floats = desc.StructureByteStride / 4;
+        logger::info("[census] structured %u-byte buffer %p, stride %u (%u elements), first %u:", size,
+                     (void*)resource, desc.StructureByteStride, size / desc.StructureByteStride, elements);
+        for (UINT e = 0; e < elements; ++e) {
+            std::string line;
+            for (UINT k = 0; k < floats; ++k) {
+                char v[16];
+                std::snprintf(v, sizeof(v), " %.3f", local[e * floats + k]);
+                line += v;
+            }
+            logger::info("[census]   [%u]%s", e, line.c_str());
+        }
+    }
     if (SUCCEEDED(hr) && dimension == D3D11_RESOURCE_DIMENSION_BUFFER && size >= 12 && size <= 65536) {
         uintptr_t frames[6];
         const auto count = logger::scan_return_addresses(frames, 6, 8192);
@@ -190,6 +219,7 @@ void report() {
     g_calls = 0;
     g_dumps = 0;
     g_camera_hits = 0;
+    g_structured_dumps = 0;
 }
 } // namespace
 
@@ -206,6 +236,15 @@ void on_present(ID3D11DeviceContext* context) {
                 g_registered = true;
             }
             g_state = State::armed;
+            if (const auto camera = CameraGame::get(); camera != nullptr && camera->data() != nullptr) {
+                const auto m = reinterpret_cast<const float*>(camera->data());
+                for (int r = 0; r < 4; ++r) {
+                    logger::info("[census] left camera view row %d: %.4f %.4f %.4f %.4f   camera-to-world row %d: "
+                                 "%.4f %.4f %.4f %.4f",
+                                 r, m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3], r, m[48 + r * 4],
+                                 m[48 + r * 4 + 1], m[48 + r * 4 + 2], m[48 + r * 4 + 3]);
+                }
+            }
             logger::backtrace("census: Present");
         }
         break;

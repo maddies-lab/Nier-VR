@@ -67,6 +67,12 @@ struct PendingMap {
 thread_local PendingMap t_pending;
 bool g_registered = false;
 
+// F4 (diagnostic): the right pass reuses the left eye's uploads, i.e. the same
+// camera drawn twice. If the eyes still differ, the difference comes from work
+// that changes state each time the draw job runs, not from camera data.
+std::atomic<bool> g_same_camera_test{false};
+bool g_test_key_was_down = false;
+
 // Logged once per (size, offset, kind) so the log shows which buffers are patched.
 std::vector<uint64_t> g_seen_fields;
 
@@ -380,7 +386,7 @@ void __fastcall draw_job_detour(void* device) {
     }
 
     // Right eye: same queue, the camera uploads redone with the right eye.
-    if (!upload_right_eye(context, views.secondary_scene)) {
+    if (!g_same_camera_test && !upload_right_eye(context, views.secondary_scene)) {
         return;
     }
     const uint64_t wait2 = hooks::context::read_map_ticks();
@@ -442,6 +448,15 @@ void on_present(ID3D11DeviceContext* context) {
         hooks::context::add_observer({on_map, on_unmap, nullptr});
         g_registered = true;
     }
+    const bool test_down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+    if (test_down && !g_test_key_was_down) {
+        g_same_camera_test = !g_same_camera_test;
+        logger::info("[stereo] F4 test: right pass %s", g_same_camera_test ? "uses the LEFT camera (both eyes identical "
+                                                                             "unless state advances per pass)"
+                                                                           : "uses the right camera");
+    }
+    g_test_key_was_down = test_down;
+
     // The next frame's uploads start after this Present.
     std::scoped_lock _{g_uploads_mutex};
     if (!g_uploads.empty() && ++g_frames % 300 == 0) {
