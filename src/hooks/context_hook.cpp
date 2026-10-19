@@ -29,6 +29,8 @@ constexpr size_t k_copy_subresource_region = 46;
 constexpr size_t k_copy_resource = 47;
 constexpr size_t k_update_subresource = 48;
 
+Observer g_observers[4];
+std::atomic<int> g_observer_count{0};
 std::atomic<uint64_t> g_counters[count_kinds];
 
 using DIIFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
@@ -66,6 +68,11 @@ void STDMETHODCALLTYPE copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11R
 void STDMETHODCALLTYPE update(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, const D3D11_BOX* box,
                               const void* data, UINT pitch, UINT depth_pitch) {
     ++g_counters[count_update_subresource];
+    for (int i = 0; i < g_observer_count; ++i) {
+        if (g_observers[i].on_update) {
+            g_observers[i].on_update(dst, ds, box, data);
+        }
+    }
     g_update(c, dst, ds, box, data, pitch, depth_pitch);
 }
 
@@ -133,8 +140,6 @@ MapFn g_map = nullptr;
 UnmapFn g_unmap = nullptr;
 std::atomic<bool> g_installed{false};
 
-Observer g_observers[4];
-std::atomic<int> g_observer_count{0};
 std::atomic<bool> g_observe_draws{false};
 thread_local uint64_t t_read_map_ticks = 0;
 
@@ -313,6 +318,11 @@ void set_write_observation(bool enabled) {
 HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     return g_map(context, resource, subresource, type, flags, mapped);
+}
+
+void update_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, const D3D11_BOX* box,
+                     const void* data, UINT row_pitch, UINT depth_pitch) {
+    g_update(context, resource, subresource, box, data, row_pitch, depth_pitch);
 }
 
 uint64_t counter(Counter which) {

@@ -23,6 +23,8 @@ struct Observer {
     // Called before every draw call while draw observation is enabled, with the
     // call's arguments (unused ones 0).
     void (*on_draw_detail)(ID3D11DeviceContext* context, int kind, const UINT (&args)[5]) = nullptr;
+    // Called before UpdateSubresource.
+    void (*on_update)(ID3D11Resource* resource, UINT subresource, const D3D11_BOX* box, const void* data) = nullptr;
 };
 
 // Idempotent. Hooks the context's vtable functions on first call.
@@ -37,6 +39,8 @@ void set_write_observation(bool enabled);
 HRESULT map_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped);
 void unmap_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource);
+void update_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, const D3D11_BOX* box,
+                     const void* data, UINT row_pitch, UINT depth_pitch);
 
 // Calls counted on the context since start (both-eyes pass comparison).
 enum Counter {

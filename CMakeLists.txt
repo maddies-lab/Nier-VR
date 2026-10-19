@@ -53,6 +53,7 @@ add_library(nier_vr SHARED
     src/game/stereo_render.cpp
     src/game/dump.cpp
     src/game/inspect.cpp
+    src/game/player.cpp
     src/game/watch.cpp
     src/hooks/context_hook.cpp
     src/hooks/d3d11_hook.cpp

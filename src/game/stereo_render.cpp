@@ -325,6 +325,14 @@ struct Upload {
     std::vector<Field> fields;
 };
 
+// Camera constants the draw job itself uploads with UpdateSubresource (the effect
+// shaders' copy of the camera, exe+0x274F00): done only while CameraData+0x28C is
+// set, which the upload clears, so the right pass drew effects (shockwaves, the
+// charged-attack slashes) with the left eye's camera. Recorded in the left pass,
+// re-sent with the right eye's values before the right pass.
+std::atomic<bool> g_record_job_updates{false};
+std::vector<Upload> g_job_updates; // draw-job thread
+
 std::mutex g_uploads_mutex;
 std::vector<Upload> g_uploads; // this frame's camera uploads, one per buffer (cleared at Present)
 constexpr size_t k_max_camera_uploads = 32;
@@ -464,6 +472,65 @@ void on_unmap(ID3D11Resource* resource) {
     g_uploads.push_back(std::move(upload));
 }
 
+void on_update(ID3D11Resource* resource, UINT subresource, const D3D11_BOX* box, const void* data) {
+    if (!g_record_job_updates || data == nullptr || box != nullptr || subresource != 0) {
+        return;
+    }
+    D3D11_RESOURCE_DIMENSION dimension{};
+    resource->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER) {
+        return;
+    }
+    D3D11_BUFFER_DESC desc{};
+    static_cast<ID3D11Buffer*>(resource)->GetDesc(&desc);
+    if ((desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) == 0 || desc.ByteWidth < 12 || desc.ByteWidth > 4096) {
+        return;
+    }
+    const auto bytes = static_cast<const uint8_t*>(data);
+    auto fields = find_camera_fields(reinterpret_cast<const float*>(bytes), desc.ByteWidth);
+    if (fields.empty()) {
+        return;
+    }
+    for (const auto& field : fields) {
+        const uint64_t key = (1ull << 63) | (uint64_t(desc.ByteWidth) << 32) | (uint64_t(field.offset) << 8) |
+                             uint64_t(field.what);
+        if (std::find(g_seen_fields.begin(), g_seen_fields.end(), key) == g_seen_fields.end() &&
+            g_seen_fields.size() < 64) {
+            g_seen_fields.push_back(key);
+            logger::info("[stereo] in-job camera upload (UpdateSubresource): %u-byte buffer +0x%x = %s%s",
+                         desc.ByteWidth, field.offset, k_what_names[static_cast<int>(field.what)],
+                         field.transposed ? " (transposed)" : "");
+        }
+    }
+    Upload upload{resource, std::vector<uint8_t>(bytes, bytes + desc.ByteWidth), std::move(fields)};
+    for (auto& existing : g_job_updates) {
+        if (existing.resource == resource) {
+            existing = std::move(upload);
+            return;
+        }
+    }
+    g_job_updates.push_back(std::move(upload));
+}
+
+// The data of `upload` with the camera fields replaced by the right eye's.
+std::vector<uint8_t> substituted(const Upload& upload, const float (&right)[4][16], const float (&position)[3]) {
+    std::vector<uint8_t> out = upload.data;
+    for (const auto& field : upload.fields) {
+        auto f = reinterpret_cast<float*>(out.data() + field.offset);
+        if (field.what == What::position) {
+            std::memcpy(f, position, sizeof(position));
+            continue;
+        }
+        const float* m = right[static_cast<int>(field.what)];
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                f[r * 4 + c] = field.transposed ? m[c * 4 + r] : m[r * 4 + c];
+            }
+        }
+    }
+    return out;
+}
+
 // Re-uploads this frame's camera uploads with the right eye's values.
 bool upload_right_eye(ID3D11DeviceContext* context, const float (&scene)[64]) {
     // The SceneBuffer block holds the right eye's matrices transposed.
@@ -478,6 +545,11 @@ bool upload_right_eye(ID3D11DeviceContext* context, const float (&scene)[64]) {
     }
     std::memcpy(right[3], g_have_previous_right ? g_previous_right_view_projection : right[1], sizeof(right[3]));
     const float position[3] = {right[2][12], right[2][13], right[2][14]};
+
+    for (const auto& upload : g_job_updates) {
+        const auto data = substituted(upload, right, position);
+        hooks::context::update_original(context, upload.resource, 0, nullptr, data.data(), 0, 0);
+    }
 
     std::scoped_lock _{g_uploads_mutex};
     if (g_uploads.empty()) {
@@ -868,6 +940,8 @@ void __fastcall draw_job_detour(void* device) {
     const auto left_before = read_counts();
     g_lights.clear();
     g_light_mode = LightMode::record;
+    g_job_updates.clear();
+    g_record_job_updates = true;
     const bool census = g_census_armed;
     g_census_armed = false;
     if (census) {
@@ -877,6 +951,7 @@ void __fastcall draw_job_detour(void* device) {
     g_draw_job(device);
     add_pass_counts(0, left_before, read_counts());
     g_light_mode = LightMode::pass_through;
+    g_record_job_updates = false;
     hooks::context::set_write_observation(false);
     QueryPerformanceCounter(&t1);
     const uint64_t wait1 = hooks::context::read_map_ticks();
@@ -995,7 +1070,7 @@ bool install() {
 
 void on_present(ID3D11DeviceContext* context) {
     if (!g_registered && context != nullptr && hooks::context::install(context)) {
-        hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views, on_draw_detail});
+        hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views, on_draw_detail, on_update});
         g_registered = true;
     }
     const bool test_down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;

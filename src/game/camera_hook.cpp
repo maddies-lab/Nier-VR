@@ -11,6 +11,7 @@
 #include <MinHook.h>
 
 #include "game/camera.hpp"
+#include "game/player.hpp"
 #include "log.hpp"
 #include "math.hpp"
 #include "scan.hpp"
@@ -57,6 +58,7 @@ CameraUpdateFn g_camera_update_original = nullptr;
 std::atomic<uint64_t> g_camera_update_ms{0};
 constexpr uint64_t k_paused_after_ms = 50;
 bool g_was_paused = false;
+bool g_was_player_down = false;
 
 void __fastcall camera_update_detour(void* camera) {
     g_camera_update_ms = GetTickCount64();
@@ -237,6 +239,14 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
         g_was_paused = paused;
     }
 
+    // Game over: the camera keeps mode 0 and keeps running, but the player is at 0 HP.
+    const auto health = player::health();
+    const bool player_down = health && *health == 0;
+    if (player_down != g_was_player_down) {
+        logger::info("[camera_hook] player %s", player_down ? "down (theater)" : "alive");
+        g_was_player_down = player_down;
+    }
+
     // The game's own fov/aspect: our wide values are only present during the
     // original call below, because the camera controller eases from the stored fov
     // and per-object LOD reads it (NieRVR's notes found both).
@@ -245,7 +255,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
 
     xr::trace("update");
     xr::RenderView view, second_view;
-    const int views = (game_aspect <= 0.0f || is_theater_mode(mode) || paused)
+    const int views = (game_aspect <= 0.0f || is_theater_mode(mode) || paused || player_down)
                           ? 0
                           : xr::begin_render_views(game_aspect, view, second_view);
     if (views == 0) {
