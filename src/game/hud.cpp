@@ -187,8 +187,13 @@ BlendPair hud_blend(ID3D11Device* device, ID3D11BlendState* original) {
     return pair;
 }
 
+enum class Kind { other, hud, screen_effect };
+Kind g_last_kind = Kind::other;
+std::vector<uintptr_t> g_logged_effects;
+
 // Is the next draw a UI draw into the scene target? Returns the target's desc.
 bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
+    g_last_kind = Kind::other;
     ID3D11Buffer* scene = nullptr;
     context->VSGetConstantBuffers(0, 1, &scene);
     const bool ortho = scene != nullptr && is_ortho(scene);
@@ -271,6 +276,33 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     }
     samples_screen = samples_screen && !sprite_shader;
 
+    // Full-screen quads that blend over the image are screen effects (sprint speed
+    // lines / radial blur, vignettes): head-locked in VR, so they are removed. The
+    // scene composite is an opaque copy and stays.
+    if (samples_screen) {
+        ID3D11BlendState* blend = nullptr;
+        float factor[4];
+        UINT mask = 0;
+        context->OMGetBlendState(&blend, factor, &mask);
+        bool blends = false;
+        if (blend != nullptr) {
+            D3D11_BLEND_DESC desc{};
+            blend->GetDesc(&desc);
+            blends = desc.RenderTarget[0].BlendEnable != FALSE;
+            blend->Release();
+        }
+        if (blends) {
+            g_last_kind = Kind::screen_effect;
+            if (std::find(g_logged_effects.begin(), g_logged_effects.end(), ps_key) == g_logged_effects.end() &&
+                g_logged_effects.size() < 32) {
+                g_logged_effects.push_back(ps_key);
+                logger::info("[hud] full-screen effect (ps %llx) removed while head-tracked", (unsigned long long)ps_key);
+            }
+        }
+    } else {
+        g_last_kind = Kind::hud;
+    }
+
     // Log each kind of large-texture UI-camera draw once, to tune this rule.
     if (largest_w * 4 >= target.Width) {
         ID3D11PixelShader* ps = nullptr;
@@ -296,7 +328,11 @@ bool before_draw(ID3D11DeviceContext* context) {
         return false;
     }
     D3D11_TEXTURE2D_DESC target{};
-    if (!is_ui_draw(context, target)) {
+    const bool ui = is_ui_draw(context, target);
+    if (g_last_kind == Kind::screen_effect) {
+        return true; // skipped in every head-tracked pass
+    }
+    if (!ui) {
         return false;
     }
     if (mode == Mode::suppress) {
