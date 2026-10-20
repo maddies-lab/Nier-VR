@@ -14,6 +14,7 @@
 #include <MinHook.h>
 
 #include "game/camera.hpp"
+#include "game/hud.hpp"
 #include "hooks/context_hook.hpp"
 #include "log.hpp"
 #include "scan.hpp"
@@ -913,7 +914,16 @@ void __fastcall draw_job_detour(void* device) {
     if (!have_uploads || context == nullptr || !xr::job_views(views)) {
         g_have_previous_right = false;
         ++g_single;
+        // One pass (mono, alternate eyes, theater): HUD layer while head-tracked.
+        const bool hud_layer = context != nullptr && xr::projected_active();
+        if (hud_layer) {
+            hud::begin_pass(context, hud::Mode::capture);
+        }
         g_draw_job(device);
+        if (hud_layer) {
+            hud::end_pass();
+            xr::publish_hud(hud::captured_any() ? hud::texture() : nullptr);
+        }
         return;
     }
 
@@ -942,6 +952,7 @@ void __fastcall draw_job_detour(void* device) {
     g_light_mode = LightMode::record;
     g_job_updates.clear();
     g_record_job_updates = true;
+    hud::begin_pass(context, hud::Mode::capture);
     const bool census = g_census_armed;
     g_census_armed = false;
     if (census) {
@@ -950,6 +961,7 @@ void __fastcall draw_job_detour(void* device) {
     }
     g_draw_job(device);
     add_pass_counts(0, left_before, read_counts());
+    hud::end_pass();
     g_light_mode = LightMode::pass_through;
     g_record_job_updates = false;
     hooks::context::set_write_observation(false);
@@ -959,6 +971,9 @@ void __fastcall draw_job_detour(void* device) {
         context->End(queries.stamps[1]);
     }
     xr::publish_from_job(views.primary, views.sequence);
+    if (hud::captured_any()) {
+        xr::publish_hud(hud::texture());
+    }
     if (timing) {
         context->End(queries.stamps[2]);
     }
@@ -981,7 +996,9 @@ void __fastcall draw_job_detour(void* device) {
     }
     g_light_replay = 0;
     g_light_mode = LightMode::replay;
+    hud::begin_pass(context, hud::Mode::suppress);
     g_draw_job(device);
+    hud::end_pass();
     g_light_mode = LightMode::pass_through;
     g_census_pass = -1;
     if (census) {
@@ -1069,6 +1086,8 @@ bool install() {
 }
 
 void on_present(ID3D11DeviceContext* context) {
+    hud::install(context);
+    hud::on_present();
     if (!g_registered && context != nullptr && hooks::context::install(context)) {
         hooks::context::add_observer({on_map, on_unmap, nullptr, on_write_views, on_draw_detail, on_update});
         g_registered = true;

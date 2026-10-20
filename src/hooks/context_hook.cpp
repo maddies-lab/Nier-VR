@@ -32,6 +32,22 @@ constexpr size_t k_update_subresource = 48;
 Observer g_observers[4];
 std::atomic<int> g_observer_count{0};
 std::atomic<uint64_t> g_counters[count_kinds];
+DrawInterceptor g_interceptor;
+std::atomic<bool> g_intercepting{false};
+
+// Runs the interceptor around a draw; returns false if the draw is to be skipped.
+struct InterceptScope {
+    ID3D11DeviceContext* context;
+    bool active;
+    explicit InterceptScope(ID3D11DeviceContext* c) : context(c), active(g_intercepting) {}
+    bool skip() { return active && g_interceptor.before(context); }
+    ~InterceptScope() {
+        if (active && !skipped && g_interceptor.after) {
+            g_interceptor.after(context);
+        }
+    }
+    bool skipped = false;
+};
 
 using DIIFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 using DIFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
@@ -79,11 +95,21 @@ void STDMETHODCALLTYPE update(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT 
 void STDMETHODCALLTYPE dii(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
     ++g_counters[count_draw];
     notify_draw_detail(c, 2, a, b, d, static_cast<UINT>(e), f);
+    InterceptScope scope{c};
+    if (scope.skip()) {
+        scope.skipped = true;
+        return;
+    }
     g_dii(c, a, b, d, e, f);
 }
 void STDMETHODCALLTYPE di(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
     ++g_counters[count_draw];
     notify_draw_detail(c, 3, a, b, d, e, 0);
+    InterceptScope scope{c};
+    if (scope.skip()) {
+        scope.skipped = true;
+        return;
+    }
     g_di(c, a, b, d, e);
 }
 void STDMETHODCALLTYPE begin(ID3D11DeviceContext* c, ID3D11Asynchronous* a) {
@@ -169,6 +195,11 @@ void notify_draw_detail(ID3D11DeviceContext* c, int kind, UINT a, UINT b, UINT d
 void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT start, INT base) {
     ++g_counters[count_draw];
     notify_draw_detail(self, 0, count, start, static_cast<UINT>(base), 0, 0);
+    InterceptScope scope{self};
+    if (scope.skip()) {
+        scope.skipped = true;
+        return;
+    }
     notify_draw("DrawIndexed");
     g_draw_indexed(self, count, start, base);
 }
@@ -176,6 +207,11 @@ void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT 
 void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
     ++g_counters[count_draw];
     notify_draw_detail(self, 1, count, start, 0, 0, 0);
+    InterceptScope scope{self};
+    if (scope.skip()) {
+        scope.skipped = true;
+        return;
+    }
     notify_draw("Draw");
     g_draw(self, count, start);
 }
@@ -309,6 +345,12 @@ void add_observer(const Observer& observer) {
 
 void set_draw_observation(bool enabled) {
     g_observe_draws = enabled;
+}
+
+void set_draw_interceptor(const DrawInterceptor& interceptor) {
+    g_intercepting = false;
+    g_interceptor = interceptor;
+    g_intercepting = interceptor.before != nullptr;
 }
 
 void set_write_observation(bool enabled) {

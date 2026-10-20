@@ -18,7 +18,7 @@
 // (DXVK's keyed mutex was tried first: its ReleaseSync makes the CPU wait for the
 // GPU to finish the game's whole frame, up to 60 ms in heavy scenes.)
 namespace xr::transport {
-constexpr int k_channels = 2; // 0 = left eye / mono / theater, 1 = right eye
+constexpr int k_channels = 3; // 0 = left eye / mono / theater, 1 = right eye, 2 = HUD layer
 
 // How the XR side should present a frame.
 struct FrameMeta {

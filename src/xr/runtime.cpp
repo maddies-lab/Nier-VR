@@ -97,6 +97,21 @@ struct EyeImage {
     transport::FrameMeta meta;   // how that frame was rendered
 };
 EyeImage g_eye_images[2];
+
+// M4 HUD layer: a quad in front of the player that follows the head lazily (stays
+// put for small head movements, eases round when the head turns away).
+constexpr float k_hud_distance = 1.8f;
+constexpr float k_hud_width = 1.6f;
+constexpr float k_hud_drop = 0.15f;                 // metres below eye level
+constexpr float k_hud_follow_start = 0.61f;         // ~35 degrees
+constexpr float k_hud_follow_stop = 0.035f;         // ~2 degrees
+constexpr double k_hud_timeout_ms = 250.0;          // hidden when the game stops sending it
+EyeImage g_hud_image;
+Clock::time_point g_hud_received{};
+float g_hud_yaw = 0.0f;
+bool g_hud_following = false;
+std::atomic<bool> g_hud_reset{true};
+std::atomic<bool> g_projected_active{false};
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
 
 // Written by the XR thread, read by game threads in begin_render_view.
@@ -466,8 +481,7 @@ bool create_swapchain(EyeImage& eye, uint32_t width, uint32_t height, DXGI_FORMA
 }
 
 // Copies a claimed game frame into its eye's swapchain.
-void copy_to_eye(const transport::Frame& frame) {
-    auto& eye = g_eye_images[frame.meta.eye == 1 ? 1 : 0];
+void copy_into(EyeImage& eye, const transport::Frame& frame) {
     if (eye.swapchain == XR_NULL_HANDLE || frame.width != eye.width || frame.height != eye.height ||
         frame.format != eye.source_format) {
         if (!create_swapchain(eye, frame.width, frame.height, frame.format)) {
@@ -502,6 +516,10 @@ uint32_t g_pairs_taken = 0, g_singles_taken = 0, g_frames_without_new = 0;
 Clock::time_point g_last_new_image = Clock::now();
 bool g_stall_logged = false;
 
+void copy_to_eye(const transport::Frame& frame) {
+    copy_into(g_eye_images[frame.meta.eye == 1 ? 1 : 0], frame);
+}
+
 // Takes the newest game frame(s): a complete both-eyes pair, or a single image
 // (theater, mono, alternate eyes, or a frame drawn for one eye only).
 void consume_game_frames() {
@@ -516,6 +534,10 @@ void consume_game_frames() {
         copy_to_eye(*frame);
         ++g_singles_taken;
         took = true;
+    }
+    if (const auto hud = transport::claim_newest(2, g_xr_device)) {
+        copy_into(g_hud_image, *hud);
+        g_hud_received = Clock::now();
     }
 
     if (took) {
@@ -581,6 +603,38 @@ void place_screen(XrTime time) {
     g_recenter = false;
     logger::info("[xr] screen placed at %.2f %.2f %.2f, yaw %.1f deg", g_screen_pose.position.x,
                  g_screen_pose.position.y, g_screen_pose.position.z, yaw * 57.29578f);
+}
+
+// The HUD quad's pose for this headset frame: head position, lazily followed yaw.
+bool place_hud(XrTime time, XrPosef& pose) {
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(fn::xrLocateSpace(g_view, g_local, time, &location)) ||
+        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0 ||
+        (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0) {
+        return false;
+    }
+    const auto& o = location.pose.orientation;
+    const float yaw = math::yaw_of({o.x, o.y, o.z, o.w});
+    if (g_hud_reset.exchange(false)) {
+        g_hud_yaw = yaw;
+        g_hud_following = false;
+    }
+    const float diff = std::remainder(yaw - g_hud_yaw, 2.0f * 3.14159265f);
+    if (std::fabs(diff) > k_hud_follow_start) {
+        g_hud_following = true;
+    }
+    if (g_hud_following) {
+        g_hud_yaw += diff * 0.08f;
+        if (std::fabs(diff) < k_hud_follow_stop) {
+            g_hud_following = false;
+        }
+    }
+    const math::Quat rotation = math::yaw_rotation(g_hud_yaw);
+    const math::Vec3 offset = math::rotate(rotation, {0.0f, -k_hud_drop, -k_hud_distance});
+    const auto& p = location.pose.position;
+    pose.orientation = {rotation.x, rotation.y, rotation.z, rotation.w};
+    pose.position = {p.x + offset.x, p.y + offset.y, p.z + offset.z};
+    return true;
 }
 
 void xr_thread() {
@@ -681,7 +735,8 @@ void xr_thread() {
         XrCompositionLayerProjectionView projection_views[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                              {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        const XrCompositionLayerBaseHeader* layers[1]{};
+        XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[2]{};
         uint32_t layer_count = 0;
         const auto& left = g_eye_images[0];
         const auto& right = g_eye_images[1];
@@ -715,6 +770,16 @@ void xr_thread() {
                 layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
             }
             layer_count = 1;
+
+            if (std::string_view{presentation} != "theater" && g_hud_image.ready &&
+                ms_since(g_hud_received) < k_hud_timeout_ms && place_hud(frame.predictedDisplayTime, hud.pose)) {
+                hud.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT; // premultiplied
+                hud.space = g_local;
+                hud.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                hud.subImage = sub_image(g_hud_image);
+                hud.size = {k_hud_width, k_hud_width * g_hud_image.height / g_hud_image.width};
+                layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&hud);
+            }
         }
 
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
@@ -780,6 +845,7 @@ bool hand_over_frame(IDXGISwapChain* swapchain) {
         std::scoped_lock _{g_job_mutex};
         g_job_views = newest;
         g_job_enabled = g_presenting_projected;
+        g_projected_active = g_presenting_projected;
         g_both_eyes_active = g_presenting_projected && newest.both;
     }
 
@@ -901,6 +967,18 @@ void trace(const char* event) {
 
 void request_recenter() {
     g_recenter = true;
+    g_hud_reset = true;
+}
+
+bool projected_active() {
+    return g_projected_active;
+}
+
+bool publish_hud(ID3D11Texture2D* texture) {
+    if (texture == nullptr || g_game_device == nullptr) {
+        return false;
+    }
+    return transport::publish(2, g_game_device, g_game_context, texture, transport::FrameMeta{});
 }
 
 namespace {
