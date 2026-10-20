@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 #include <windows.h>
@@ -35,7 +36,7 @@ D3D11_TEXTURE2D_DESC g_desc{};
 bool g_captured_any = false;
 bool g_cleared = false;
 bool g_logged_first = false;
-bool g_ui_started = false; // this pass has drawn its first HUD element
+std::vector<std::tuple<uintptr_t, UINT, UINT>> g_logged_kinds;
 
 // State saved around a redirected draw.
 bool g_redirected = false;
@@ -218,17 +219,15 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         return false;
     }
 
-    // The UI phase opens with full-screen quads through the same orthographic
-    // camera that composite the scene into the UI target; they sample a full-size
-    // texture. Once the first real HUD element (small atlas/font) has been drawn,
-    // everything else belongs to the HUD, including "frosted glass" panels (minimap
-    // and quick-menu backgrounds) that sample a blurred copy of the screen.
-    if (g_ui_started) {
-        return true;
-    }
+    // The UI phase also draws full-screen quads through the same orthographic
+    // camera: the scene composited into the UI target and screen effects. Those
+    // sample a texture of exactly the target's size. HUD elements sample atlases and
+    // fonts; "frosted glass" panels (minimap, quick-menu backgrounds) sample a
+    // reduced-resolution blurred copy of the screen and stay HUD.
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
     bool samples_screen = false;
+    UINT largest_w = 0, largest_h = 0;
     for (auto srv : srvs) {
         if (srv == nullptr) {
             continue;
@@ -241,14 +240,31 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
             if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
                 D3D11_TEXTURE2D_DESC desc{};
                 static_cast<ID3D11Texture2D*>(texture)->GetDesc(&desc);
-                samples_screen |= desc.Width * 2 >= target.Width && desc.Height * 2 >= target.Height;
+                samples_screen |= desc.Width == target.Width && desc.Height == target.Height;
+                if (desc.Width * desc.Height > largest_w * largest_h) {
+                    largest_w = desc.Width;
+                    largest_h = desc.Height;
+                }
             }
             texture->Release();
         }
         srv->Release();
     }
-    if (!samples_screen) {
-        g_ui_started = true;
+    // Log each kind of large-texture UI-camera draw once, to tune this rule.
+    if (largest_w * 4 >= target.Width) {
+        ID3D11PixelShader* ps = nullptr;
+        context->PSGetShader(&ps, nullptr, nullptr);
+        const auto key = std::make_tuple(reinterpret_cast<uintptr_t>(ps), largest_w, largest_h);
+        if (ps != nullptr) {
+            ps->Release();
+        }
+        if (std::find(g_logged_kinds.begin(), g_logged_kinds.end(), key) == g_logged_kinds.end() &&
+            g_logged_kinds.size() < 64) {
+            g_logged_kinds.push_back(key);
+            logger::info("[hud] UI-camera draw, ps %llx, largest texture %ux%u (target %ux%u): %s",
+                         (unsigned long long)std::get<0>(key), largest_w, largest_h, target.Width, target.Height,
+                         samples_screen ? "scene (full-size)" : "HUD");
+        }
     }
     return !samples_screen;
 }
@@ -331,7 +347,6 @@ void install(ID3D11DeviceContext* context) {
 }
 
 void begin_pass(ID3D11DeviceContext* context, Mode mode) {
-    g_ui_started = false;
     if (!g_enabled) {
         mode = Mode::off;
     }
