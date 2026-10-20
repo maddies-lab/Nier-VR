@@ -37,6 +37,9 @@ bool g_captured_any = false;
 bool g_cleared = false;
 bool g_logged_first = false;
 std::vector<std::tuple<uintptr_t, UINT, UINT>> g_logged_kinds;
+std::vector<uintptr_t> g_composite_ps; // pixel shaders of the scene composite
+UINT g_full_width = 0;                 // widest R11G11B10 target seen (the scene target)
+bool g_ui_started = false;             // this pass has drawn its first HUD element
 
 // State saved around a redirected draw.
 bool g_redirected = false;
@@ -211,7 +214,14 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         resource->GetType(&dimension);
         if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
             static_cast<ID3D11Texture2D*>(resource)->GetDesc(&target);
-            full_size_scene = target.Format == DXGI_FORMAT_R11G11B10_FLOAT && target.Width >= k_min_target_width;
+            // The full-resolution scene target only: the game also draws through the
+            // UI camera into half-resolution targets (downsamples feeding bloom,
+            // blur and exposure), which must stay untouched.
+            if (target.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                g_full_width = std::max(g_full_width, target.Width);
+            }
+            full_size_scene = target.Format == DXGI_FORMAT_R11G11B10_FLOAT && target.Width >= k_min_target_width &&
+                              target.Width == g_full_width;
         }
         resource->Release();
     }
@@ -219,11 +229,11 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         return false;
     }
 
-    // The UI phase also draws full-screen quads through the same orthographic
-    // camera: the scene composited into the UI target and screen effects. Those
-    // sample a texture of exactly the target's size. HUD elements sample atlases and
-    // fonts; "frosted glass" panels (minimap, quick-menu backgrounds) sample a
-    // reduced-resolution blurred copy of the screen and stay HUD.
+    // The UI phase opens with a full-screen quad that composites the scene into the
+    // UI target (samples a texture of the target's size). Its pixel shader is learned
+    // as the first such draw before any HUD element, and stays in the scene. Other
+    // draws sampling full-size textures belong to the HUD: the minimap's land layout
+    // and "frosted glass" panels.
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
     bool samples_screen = false;
@@ -250,6 +260,26 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         }
         srv->Release();
     }
+    ID3D11PixelShader* ps_now = nullptr;
+    context->PSGetShader(&ps_now, nullptr, nullptr);
+    const auto ps_key = reinterpret_cast<uintptr_t>(ps_now);
+    if (ps_now != nullptr) {
+        ps_now->Release();
+    }
+    bool composite = false;
+    if (samples_screen) {
+        const bool known = std::find(g_composite_ps.begin(), g_composite_ps.end(), ps_key) != g_composite_ps.end();
+        if (!known && !g_ui_started && g_composite_ps.size() < 8) {
+            g_composite_ps.push_back(ps_key);
+            logger::info("[hud] scene composite pixel shader %llx", (unsigned long long)ps_key);
+        }
+        composite = known || !g_ui_started;
+    }
+    if (!composite) {
+        g_ui_started = true;
+    }
+    samples_screen = composite;
+
     // Log each kind of large-texture UI-camera draw once, to tune this rule.
     if (largest_w * 4 >= target.Width) {
         ID3D11PixelShader* ps = nullptr;
@@ -263,7 +293,7 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
             g_logged_kinds.push_back(key);
             logger::info("[hud] UI-camera draw, ps %llx, largest texture %ux%u (target %ux%u): %s",
                          (unsigned long long)std::get<0>(key), largest_w, largest_h, target.Width, target.Height,
-                         samples_screen ? "scene (full-size)" : "HUD");
+                         samples_screen ? "scene (composite)" : "HUD");
         }
     }
     return !samples_screen;
@@ -347,6 +377,7 @@ void install(ID3D11DeviceContext* context) {
 }
 
 void begin_pass(ID3D11DeviceContext* context, Mode mode) {
+    g_ui_started = false;
     if (!g_enabled) {
         mode = Mode::off;
     }
