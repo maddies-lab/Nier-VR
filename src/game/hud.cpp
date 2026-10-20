@@ -213,7 +213,35 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         }
         resource->Release();
     }
-    return full_size_scene;
+    if (!full_size_scene) {
+        return false;
+    }
+
+    // The UI phase also draws full-screen quads through the same orthographic
+    // camera: the scene composited into the UI target, and screen effects. Those
+    // sample a full-size texture; HUD elements sample small atlases and fonts.
+    ID3D11ShaderResourceView* srvs[8]{};
+    context->PSGetShaderResources(0, 8, srvs);
+    bool samples_screen = false;
+    for (auto srv : srvs) {
+        if (srv == nullptr) {
+            continue;
+        }
+        ID3D11Resource* texture = nullptr;
+        srv->GetResource(&texture);
+        if (texture != nullptr) {
+            D3D11_RESOURCE_DIMENSION dimension{};
+            texture->GetType(&dimension);
+            if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+                D3D11_TEXTURE2D_DESC desc{};
+                static_cast<ID3D11Texture2D*>(texture)->GetDesc(&desc);
+                samples_screen |= desc.Width * 2 >= target.Width && desc.Height * 2 >= target.Height;
+            }
+            texture->Release();
+        }
+        srv->Release();
+    }
+    return !samples_screen;
 }
 
 bool before_draw(ID3D11DeviceContext* context) {
