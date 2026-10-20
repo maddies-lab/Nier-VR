@@ -35,6 +35,7 @@ D3D11_TEXTURE2D_DESC g_desc{};
 bool g_captured_any = false;
 bool g_cleared = false;
 bool g_logged_first = false;
+bool g_ui_started = false; // this pass has drawn its first HUD element
 
 // State saved around a redirected draw.
 bool g_redirected = false;
@@ -217,9 +218,14 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         return false;
     }
 
-    // The UI phase also draws full-screen quads through the same orthographic
-    // camera: the scene composited into the UI target, and screen effects. Those
-    // sample a full-size texture; HUD elements sample small atlases and fonts.
+    // The UI phase opens with full-screen quads through the same orthographic
+    // camera that composite the scene into the UI target; they sample a full-size
+    // texture. Once the first real HUD element (small atlas/font) has been drawn,
+    // everything else belongs to the HUD, including "frosted glass" panels (minimap
+    // and quick-menu backgrounds) that sample a blurred copy of the screen.
+    if (g_ui_started) {
+        return true;
+    }
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
     bool samples_screen = false;
@@ -240,6 +246,9 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
             texture->Release();
         }
         srv->Release();
+    }
+    if (!samples_screen) {
+        g_ui_started = true;
     }
     return !samples_screen;
 }
@@ -322,6 +331,7 @@ void install(ID3D11DeviceContext* context) {
 }
 
 void begin_pass(ID3D11DeviceContext* context, Mode mode) {
+    g_ui_started = false;
     if (!g_enabled) {
         mode = Mode::off;
     }
