@@ -37,9 +37,8 @@ bool g_captured_any = false;
 bool g_cleared = false;
 bool g_logged_first = false;
 std::vector<std::tuple<uintptr_t, UINT, UINT>> g_logged_kinds;
-std::vector<uintptr_t> g_composite_ps; // pixel shaders of the scene composite
+std::vector<uintptr_t> g_sprite_ps;    // pixel shaders that have drawn HUD sprites
 UINT g_full_width = 0;                 // widest R11G11B10 target seen (the scene target)
-bool g_ui_started = false;             // this pass has drawn its first HUD element
 
 // State saved around a redirected draw.
 bool g_redirected = false;
@@ -229,11 +228,7 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         return false;
     }
 
-    // The UI phase opens with a full-screen quad that composites the scene into the
-    // UI target (samples a texture of the target's size). Its pixel shader is learned
-    // as the first such draw before any HUD element, and stays in the scene. Other
-    // draws sampling full-size textures belong to the HUD: the minimap's land layout
-    // and "frosted glass" panels.
+    // Full-screen quads through the UI camera sample a texture of the target's size.
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
     bool samples_screen = false;
@@ -266,19 +261,15 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     if (ps_now != nullptr) {
         ps_now->Release();
     }
-    bool composite = false;
-    if (samples_screen) {
-        const bool known = std::find(g_composite_ps.begin(), g_composite_ps.end(), ps_key) != g_composite_ps.end();
-        if (!known && !g_ui_started && g_composite_ps.size() < 8) {
-            g_composite_ps.push_back(ps_key);
-            logger::info("[hud] scene composite pixel shader %llx", (unsigned long long)ps_key);
-        }
-        composite = known || !g_ui_started;
+    // A shader that draws small textures (atlases, fonts) is a HUD sprite shader;
+    // full-screen-texture draws are HUD only with such a shader (the minimap's land
+    // layout). The scene composite, transition fades (a capture of the previous
+    // view) and screen effects use other shaders and stay in the scene.
+    const bool sprite_shader = std::find(g_sprite_ps.begin(), g_sprite_ps.end(), ps_key) != g_sprite_ps.end();
+    if (!samples_screen && !sprite_shader && g_sprite_ps.size() < 64) {
+        g_sprite_ps.push_back(ps_key);
     }
-    if (!composite) {
-        g_ui_started = true;
-    }
-    samples_screen = composite;
+    samples_screen = samples_screen && !sprite_shader;
 
     // Log each kind of large-texture UI-camera draw once, to tune this rule.
     if (largest_w * 4 >= target.Width) {
@@ -293,7 +284,7 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
             g_logged_kinds.push_back(key);
             logger::info("[hud] UI-camera draw, ps %llx, largest texture %ux%u (target %ux%u): %s",
                          (unsigned long long)std::get<0>(key), largest_w, largest_h, target.Width, target.Height,
-                         samples_screen ? "scene (composite)" : "HUD");
+                         samples_screen ? "scene" : "HUD");
         }
     }
     return !samples_screen;
@@ -377,7 +368,6 @@ void install(ID3D11DeviceContext* context) {
 }
 
 void begin_pass(ID3D11DeviceContext* context, Mode mode) {
-    g_ui_started = false;
     if (!g_enabled) {
         mode = Mode::off;
     }
