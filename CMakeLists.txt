@@ -43,6 +43,7 @@ set(PROXY_DIR ${CMAKE_SOURCE_DIR}/src/proxy/generated)
 
 add_library(nier_vr SHARED
     src/dllmain.cpp
+    src/config.cpp
     src/log.cpp
     src/scan.cpp
     src/overlay.cpp

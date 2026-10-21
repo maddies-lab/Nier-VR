@@ -4,6 +4,7 @@
 
 #include <MinHook.h>
 
+#include "config.hpp"
 #include "game/build.hpp"
 #include "game/camera.hpp"
 #include "game/camera_hook.hpp"
@@ -81,6 +82,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         }
 
         logger::open();
+        config::load();
         logger::info("NieR-VR loaded");
 
         if (!proxy::load_system_dll()) {

@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "config.hpp"
 #include "log.hpp"
 #include "xr/frame_transport.hpp"
 #include "xr/openxr.hpp"
@@ -100,10 +101,7 @@ EyeImage g_eye_images[2];
 
 // M4 HUD layer: a quad in front of the player that follows the head lazily (stays
 // put for small head movements, eases round when the head turns away).
-constexpr float k_hud_distance = 1.8f;
-constexpr float k_hud_width = 1.6f;
-constexpr float k_hud_drop = 0.15f;                 // metres below eye level
-constexpr float k_hud_follow_start = 0.61f;         // ~35 degrees
+// Size, distance, drop and follow angle come from config (NieR-VR.ini, hotkeys).
 constexpr float k_hud_follow_stop = 0.035f;         // ~2 degrees
 constexpr double k_hud_timeout_ms = 250.0;          // hidden when the game stops sending it
 EyeImage g_hud_image;
@@ -620,7 +618,7 @@ bool place_hud(XrTime time, XrPosef& pose) {
         g_hud_following = false;
     }
     const float diff = std::remainder(yaw - g_hud_yaw, 2.0f * 3.14159265f);
-    if (std::fabs(diff) > k_hud_follow_start) {
+    if (std::fabs(diff) > config::hud().follow_degrees * 0.0174533f) {
         g_hud_following = true;
     }
     if (g_hud_following) {
@@ -630,7 +628,8 @@ bool place_hud(XrTime time, XrPosef& pose) {
         }
     }
     const math::Quat rotation = math::yaw_rotation(g_hud_yaw);
-    const math::Vec3 offset = math::rotate(rotation, {0.0f, -k_hud_drop, -k_hud_distance});
+    const math::Vec3 offset =
+        math::rotate(rotation, {0.0f, -config::hud().drop.load(), -config::hud().distance.load()});
     const auto& p = location.pose.position;
     pose.orientation = {rotation.x, rotation.y, rotation.z, rotation.w};
     pose.position = {p.x + offset.x, p.y + offset.y, p.z + offset.z};
@@ -777,7 +776,8 @@ void xr_thread() {
                 hud.space = g_local;
                 hud.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 hud.subImage = sub_image(g_hud_image);
-                hud.size = {k_hud_width, k_hud_width * g_hud_image.height / g_hud_image.width};
+                const float width = config::hud().width;
+                hud.size = {width, width * g_hud_image.height / g_hud_image.width};
                 layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&hud);
             }
         }
@@ -905,6 +905,31 @@ void on_present(IDXGISwapChain* swapchain) {
         logger::info("[xr] pose pairing: %s", g_pairing ? "previous Present (pipelined)" : "newest");
     }
     g_pairing_key_was_down = pairing_down;
+
+    // HUD panel: numpad +/- size, numpad 8/2 nearer/farther, numpad 4/6 lower/higher.
+    struct HudKey {
+        int key;
+        std::atomic<float>* value;
+        float step, low, high;
+    };
+    auto& hud = config::hud();
+    static const HudKey hud_keys[] = {
+        {VK_ADD, &hud.width, 0.1f, 0.3f, 6.0f},      {VK_SUBTRACT, &hud.width, -0.1f, 0.3f, 6.0f},
+        {VK_NUMPAD8, &hud.distance, -0.1f, 0.5f, 6.0f}, {VK_NUMPAD2, &hud.distance, 0.1f, 0.5f, 6.0f},
+        {VK_NUMPAD4, &hud.drop, 0.05f, -2.0f, 2.0f},  {VK_NUMPAD6, &hud.drop, -0.05f, -2.0f, 2.0f},
+    };
+    static bool hud_key_down[6]{};
+    for (int i = 0; i < 6; ++i) {
+        const bool down = (GetAsyncKeyState(hud_keys[i].key) & 0x8000) != 0;
+        if (down && !hud_key_down[i]) {
+            const auto& k = hud_keys[i];
+            k.value->store(std::clamp(k.value->load() + k.step, k.low, k.high));
+            config::save_hud();
+            logger::info("[config] hud width %.2f m, distance %.2f m, drop %.2f m", hud.width.load(),
+                         hud.distance.load(), hud.drop.load());
+        }
+        hud_key_down[i] = down;
+    }
 
     const bool stereo_down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (stereo_down && !g_stereo_key_was_down) {

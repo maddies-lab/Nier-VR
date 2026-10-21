@@ -80,7 +80,7 @@ void draw_window(IDXGISwapChain* swapchain) {
     ImGui::SetNextWindowPos(ImVec2{16, 16}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
     ImGui::Begin("NieR-VR  M1", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("Insert: overlay  Home: HUD  End/PgDn/PgUp: effect hunt  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9-F11: RE");
+    ImGui::Text("Insert: overlay  Home: HUD  Num+/-/8/2/4/6: HUD size/distance/height  End/PgDn/PgUp: effect hunt  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9-F11: RE");
     ImGui::Separator();
     ImGui::Text("Build: %s (stamp 0x%08X)", g_build.name != nullptr ? g_build.name : "UNKNOWN", g_build.timestamp);
     ImGui::Text("Backbuffer: %u x %u, format %d, frame %llu", desc.BufferDesc.Width, desc.BufferDesc.Height,
