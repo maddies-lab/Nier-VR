@@ -235,6 +235,36 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
         return false;
     }
 
+    // Whitelist: HUD elements are drawn with the UI parameter buffer (UIParam /
+    // cbUIParam, 128 or 160 bytes) at VS b1. Other draws through the UI camera
+    // (damage and low-health vignettes, transitions, effect-system quads) stay in
+    // the scene.
+    ID3D11Buffer* ui_param = nullptr;
+    context->VSGetConstantBuffers(1, 1, &ui_param);
+    UINT ui_param_size = 0;
+    if (ui_param != nullptr) {
+        D3D11_BUFFER_DESC desc{};
+        ui_param->GetDesc(&desc);
+        ui_param_size = desc.ByteWidth;
+        ui_param->Release();
+    }
+    if (ui_param_size != 128 && ui_param_size != 160) {
+        ID3D11PixelShader* ps = nullptr;
+        context->PSGetShader(&ps, nullptr, nullptr);
+        const auto key = reinterpret_cast<uintptr_t>(ps);
+        if (ps != nullptr) {
+            ps->Release();
+        }
+        if (std::find(g_logged_effects.begin(), g_logged_effects.end(), key) == g_logged_effects.end() &&
+            g_logged_effects.size() < 64) {
+            g_logged_effects.push_back(key);
+            logger::info("[hud] UI-camera draw without UIParam (ps %llx, VS b1 %u B) kept in the scene",
+                         (unsigned long long)key, ui_param_size);
+        }
+        g_last_kind = Kind::screen_effect;
+        return false;
+    }
+
     // Full-screen quads through the UI camera sample a texture of the target's size.
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
