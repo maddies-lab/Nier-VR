@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 
+#include "config.hpp"
 #include "game/build.hpp"
 #include "game/census.hpp"
 #include "game/stereo_render.hpp"
@@ -80,7 +81,7 @@ void draw_window(IDXGISwapChain* swapchain) {
     ImGui::SetNextWindowPos(ImVec2{16, 16}, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
     ImGui::Begin("NieR-VR  M1", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("Insert: overlay  Home: HUD  Num+/-/8/2/4/6: HUD size/distance/height  End/PgDn/PgUp: effect hunt  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9-F11: RE");
+    ImGui::Text("Insert: overlay  Home: HUD  Num+/-/8/2/4/6: HUD  Num0: comfort vignette  End/PgDn/PgUp: effect hunt  F5: stereo/mono  F6: pose pairing  F7: head tracking  F8: recenter  F9-F11: RE");
     ImGui::Separator();
     ImGui::Text("Build: %s (stamp 0x%08X)", g_build.name != nullptr ? g_build.name : "UNKNOWN", g_build.timestamp);
     ImGui::Text("Backbuffer: %u x %u, format %d, frame %llu", desc.BufferDesc.Width, desc.BufferDesc.Height,
@@ -103,6 +104,8 @@ void draw_window(IDXGISwapChain* swapchain) {
                 vr.xr_copy.avg_ms, vr.xr_copy.max_ms, vr.xr_end.avg_ms, vr.xr_end.max_ms);
     ImGui::Text("  game    %5.1f fps  dropped %4.1f fps  copy %4.2f/%4.2f ms (avg/max)", vr.game_fps,
                 vr.dropped_fps, vr.game_copy.avg_ms, vr.game_copy.max_ms);
+    ImGui::Text("  game camera turn %.0f deg/s (comfort vignette %s)", vr.turn_rate,
+                config::comfort().vignette ? "on" : "off");
     if (!vr.last_error.empty()) {
         ImGui::TextColored(ImVec4{1, 0.3f, 0.3f, 1}, "  %s", vr.last_error.c_str());
     }

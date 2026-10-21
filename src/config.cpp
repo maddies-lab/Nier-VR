@@ -11,6 +11,7 @@
 namespace config {
 namespace {
 Hud g_hud;
+Comfort g_comfort;
 
 std::wstring path() {
     wchar_t exe[MAX_PATH]{};
@@ -40,6 +41,10 @@ Hud& hud() {
     return g_hud;
 }
 
+Comfort& comfort() {
+    return g_comfort;
+}
+
 void load() {
     g_hud.width = read(L"hud", L"width", g_hud.width, 0.3f, 6.0f);
     g_hud.distance = read(L"hud", L"distance", g_hud.distance, 0.5f, 6.0f);
@@ -47,7 +52,24 @@ void load() {
     g_hud.follow_degrees = read(L"hud", L"follow_degrees", g_hud.follow_degrees, 0.0f, 180.0f);
     logger::info("[config] hud width %.2f m, distance %.2f m, drop %.2f m, follow after %.0f deg",
                  g_hud.width.load(), g_hud.distance.load(), g_hud.drop.load(), g_hud.follow_degrees.load());
+    g_comfort.vignette = read(L"comfort", L"vignette", g_comfort.vignette ? 1.0f : 0.0f, 0.0f, 1.0f) >= 0.5f;
+    g_comfort.strength = read(L"comfort", L"vignette_strength", g_comfort.strength, 0.0f, 1.0f);
+    g_comfort.start_speed = read(L"comfort", L"vignette_start_deg_per_s", g_comfort.start_speed, 0.0f, 720.0f);
+    g_comfort.full_speed = read(L"comfort", L"vignette_full_deg_per_s", g_comfort.full_speed, 1.0f, 1440.0f);
+    if (g_comfort.full_speed <= g_comfort.start_speed) {
+        g_comfort.full_speed = g_comfort.start_speed + 1.0f;
+    }
+    logger::info("[config] comfort vignette %s, strength %.2f, %.0f..%.0f deg/s", g_comfort.vignette ? "on" : "off",
+                 g_comfort.strength.load(), g_comfort.start_speed.load(), g_comfort.full_speed.load());
     save_hud(); // writes defaults for keys the file lacks, so they can be edited
+    save_comfort();
+}
+
+void save_comfort() {
+    write(L"comfort", L"vignette", g_comfort.vignette ? 1.0f : 0.0f);
+    write(L"comfort", L"vignette_strength", g_comfort.strength);
+    write(L"comfort", L"vignette_start_deg_per_s", g_comfort.start_speed);
+    write(L"comfort", L"vignette_full_deg_per_s", g_comfort.full_speed);
 }
 
 void save_hud() {

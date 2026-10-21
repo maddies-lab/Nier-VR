@@ -163,6 +163,29 @@ CameraBasis camera_basis(const Vec4& eye, const Vec4& target, const Vec4& up) {
     return basis;
 }
 
+// Yaw speed of the game camera (stick turns, follow-camera swings), smoothed, for
+// the comfort vignette. Jumps over 60 degrees in one update are camera cuts.
+void measure_turn_rate(const CameraBasis& basis) {
+    static float last_yaw = 0.0f;
+    static LARGE_INTEGER last_time{};
+    static float rate = 0.0f;
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    const float yaw = std::atan2(basis.back.x, basis.back.z);
+    if (last_time.QuadPart != 0) {
+        const float dt = static_cast<float>(now.QuadPart - last_time.QuadPart) / frequency.QuadPart;
+        const float delta = std::fabs(std::remainder(yaw - last_yaw, 2.0f * 3.14159265f));
+        if (dt > 0.0f && dt < 0.25f && delta < 1.05f) {
+            const float instant = delta / dt * 57.29578f;
+            rate += (instant - rate) * 0.3f;
+        }
+    }
+    last_yaw = yaw;
+    last_time = now;
+    xr::set_game_turn_rate(rate);
+}
+
 // The fov/aspect the game rebuilds its projection and culling frustum from, while
 // the original update runs.
 void set_culling_fov(CameraData* data, const xr::RenderView& view) {
@@ -259,6 +282,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
                           ? 0
                           : xr::begin_render_views(game_aspect, view, second_view);
     if (views == 0) {
+        xr::set_game_turn_rate(0.0f);
         if (g_projection_is_ours) {
             field<int>(data, k_projection_dirty) = 1; // rebuild the game's own projection
             g_projection_is_ours = false;
@@ -269,6 +293,7 @@ void __fastcall update_detour(CameraData** holder, const Vec4* eye, const Vec4* 
     }
 
     const auto basis = camera_basis(*eye, *target, *up);
+    measure_turn_rate(basis);
     Vec4 vr_eye, vr_target, vr_up;
     basis.place(view, *eye, *target, *up, vr_eye, vr_target, vr_up);
 

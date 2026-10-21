@@ -110,6 +110,17 @@ float g_hud_yaw = 0.0f;
 bool g_hud_following = false;
 std::atomic<bool> g_hud_reset{true};
 std::atomic<bool> g_projected_active{false};
+
+// M5 comfort vignette: head-locked quad, a black radial gradient whose strength
+// follows the game camera's turn speed. Regenerated only when the strength level
+// changes (32 levels).
+constexpr uint32_t k_vignette_size = 256;
+constexpr int k_vignette_levels = 32;
+constexpr float k_vignette_quad = 2.8f; // metres at 1 m: covers about +-54 degrees
+std::atomic<float> g_turn_rate{0.0f};
+XrSwapchain g_vignette_swapchain = XR_NULL_HANDLE;
+std::vector<ID3D11Texture2D*> g_vignette_images;
+int g_vignette_level = -1;
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
 
 // Written by the XR thread, read by game threads in begin_render_view.
@@ -603,6 +614,93 @@ void place_screen(XrTime time) {
                  g_screen_pose.position.y, g_screen_pose.position.z, yaw * 57.29578f);
 }
 
+bool create_vignette_swapchain() {
+    uint32_t count = 0;
+    fn::xrEnumerateSwapchainFormats(g_session, 0, &count, nullptr);
+    std::vector<int64_t> formats(count);
+    fn::xrEnumerateSwapchainFormats(g_session, count, &count, formats.data());
+    int64_t chosen = 0;
+    for (const auto wanted : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB}) {
+        for (const auto f : formats) {
+            if (chosen == 0 && f == wanted) {
+                chosen = f;
+            }
+        }
+    }
+    if (chosen == 0) {
+        return false;
+    }
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                      XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    info.format = chosen;
+    info.sampleCount = 1;
+    info.width = k_vignette_size;
+    info.height = k_vignette_size;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!check(fn::xrCreateSwapchain(g_session, &info, &g_vignette_swapchain), "xrCreateSwapchain(vignette)")) {
+        return false;
+    }
+    fn::xrEnumerateSwapchainImages(g_vignette_swapchain, 0, &count, nullptr);
+    std::vector<XrSwapchainImageD3D11KHR> images(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    fn::xrEnumerateSwapchainImages(g_vignette_swapchain, count, &count,
+                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
+    for (const auto& image : images) {
+        g_vignette_images.push_back(image.texture);
+    }
+    return true;
+}
+
+// The vignette's strength (0..1) for the current turn speed, or 0 when off.
+float vignette_strength() {
+    const auto& comfort = config::comfort();
+    if (!comfort.vignette) {
+        return 0.0f;
+    }
+    const float t = (g_turn_rate - comfort.start_speed) / (comfort.full_speed - comfort.start_speed);
+    return std::clamp(t, 0.0f, 1.0f) * comfort.strength;
+}
+
+// Uploads the gradient for `level` when it changed. Returns whether the layer can be shown.
+bool update_vignette(int level) {
+    if (g_vignette_swapchain == XR_NULL_HANDLE && !create_vignette_swapchain()) {
+        return false;
+    }
+    if (level == g_vignette_level) {
+        return true;
+    }
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(fn::xrAcquireSwapchainImage(g_vignette_swapchain, &acquire, &index))) {
+        return false;
+    }
+    if (XR_SUCCEEDED(fn::xrWaitSwapchainImage(g_vignette_swapchain, &wait))) {
+        // Premultiplied black: colour 0, alpha = strength * smoothstep over the radius.
+        static std::vector<uint32_t> pixels(k_vignette_size * k_vignette_size);
+        const float strength = float(level) / k_vignette_levels;
+        for (uint32_t y = 0; y < k_vignette_size; ++y) {
+            for (uint32_t x = 0; x < k_vignette_size; ++x) {
+                const float u = (x + 0.5f) / k_vignette_size * 2.0f - 1.0f;
+                const float v = (y + 0.5f) / k_vignette_size * 2.0f - 1.0f;
+                const float r = std::sqrt(u * u + v * v);
+                float t = std::clamp((r - 0.30f) / (0.85f - 0.30f), 0.0f, 1.0f);
+                t = t * t * (3.0f - 2.0f * t);
+                const auto alpha = static_cast<uint32_t>(std::lround(t * strength * 255.0f));
+                pixels[y * k_vignette_size + x] = alpha << 24;
+            }
+        }
+        g_xr_context->UpdateSubresource(g_vignette_images.at(index), 0, nullptr, pixels.data(), k_vignette_size * 4, 0);
+        g_vignette_level = level;
+    }
+    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    fn::xrReleaseSwapchainImage(g_vignette_swapchain, &release);
+    return g_vignette_level == level;
+}
+
 // The HUD quad's pose for this headset frame: head position, lazily followed yaw.
 bool place_hud(XrTime time, XrPosef& pose) {
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
@@ -735,7 +833,8 @@ void xr_thread() {
                                                              {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        const XrCompositionLayerBaseHeader* layers[2]{};
+        XrCompositionLayerQuad vignette{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[3]{};
         uint32_t layer_count = 0;
         const auto& left = g_eye_images[0];
         const auto& right = g_eye_images[1];
@@ -769,6 +868,20 @@ void xr_thread() {
                 layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
             }
             layer_count = 1;
+
+            const int level = std::string_view{presentation} != "theater"
+                                  ? static_cast<int>(std::lround(vignette_strength() * k_vignette_levels))
+                                  : 0;
+            if (level > 0 && update_vignette(level)) {
+                vignette.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                vignette.space = g_view; // head-locked
+                vignette.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                vignette.subImage.swapchain = g_vignette_swapchain;
+                vignette.subImage.imageRect = {{0, 0}, {int32_t(k_vignette_size), int32_t(k_vignette_size)}};
+                vignette.pose = {{0, 0, 0, 1}, {0, 0, -1.0f}};
+                vignette.size = {k_vignette_quad, k_vignette_quad};
+                layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&vignette);
+            }
 
             if (std::string_view{presentation} != "theater" && g_hud_image.ready &&
                 ms_since(g_hud_received) < k_hud_timeout_ms && place_hud(frame.predictedDisplayTime, hud.pose)) {
@@ -931,6 +1044,15 @@ void on_present(IDXGISwapChain* swapchain) {
         hud_key_down[i] = down;
     }
 
+    static bool vignette_key_down = false;
+    const bool vignette_down = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
+    if (vignette_down && !vignette_key_down) {
+        config::comfort().vignette = !config::comfort().vignette;
+        config::save_comfort();
+        logger::info("[config] comfort vignette %s", config::comfort().vignette ? "on" : "off");
+    }
+    vignette_key_down = vignette_down;
+
     const bool stereo_down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (stereo_down && !g_stereo_key_was_down) {
         g_stereo_mode = (g_stereo_mode + 1) % 3;
@@ -960,6 +1082,7 @@ void on_present(IDXGISwapChain* swapchain) {
         g_status.dropped_fps = static_cast<float>(g_dropped_frames * 1000.0 / elapsed);
         g_status.game_copy = g_game_copy_time.take();
         g_status.transport = transport::description();
+        g_status.turn_rate = g_turn_rate;
         g_status.head_tracking = g_head_tracking;
         g_status.pairing = g_pairing;
         g_status.stereo_mode = stereo_mode_name(g_stereo_mode);
@@ -993,6 +1116,10 @@ void trace(const char* event) {
 void request_recenter() {
     g_recenter = true;
     g_hud_reset = true;
+}
+
+void set_game_turn_rate(float degrees_per_second) {
+    g_turn_rate = degrees_per_second;
 }
 
 bool projected_active() {

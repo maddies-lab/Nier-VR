@@ -37,6 +37,7 @@ struct Status {
     float dropped_fps = 0;       // game frames that could not be handed over (errors only)
     float pairs_per_second = 0;  // both-eyes pairs taken by the XR side
     float singles_per_second = 0;
+    float turn_rate = 0;         // game camera yaw speed, deg/s (comfort vignette)
     Timing xr_wait, xr_begin, xr_copy, xr_end; // XR thread
     Timing game_copy;                          // render thread: backbuffer -> shared texture
 };
@@ -79,6 +80,8 @@ bool publish_from_job(const transport::FrameMeta& meta, uint64_t sequence);
 void mark_both_rendered(uint64_t sequence);
 
 ID3D11DeviceContext* game_context();
+// Game thread: the game camera's yaw speed (deg/s), for the comfort vignette.
+void set_game_turn_rate(float degrees_per_second);
 // True while frames are presented head-tracked (mono or stereo), any thread.
 bool projected_active();
 // Game side (draw job): hands the HUD layer's texture to the headset.
