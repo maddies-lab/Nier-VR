@@ -14,9 +14,10 @@ struct Hud {
 
 struct Comfort {
     std::atomic<bool> vignette{true};
-    std::atomic<float> strength{0.85f};      // darkness at full turn speed (0..1)
-    std::atomic<float> start_speed{40.0f};   // game-camera turn speed (deg/s) where it starts
-    std::atomic<float> full_speed{150.0f};   // ... and where it is at full strength
+    std::atomic<float> strength{1.0f};       // darkness at full turn speed (0..1)
+    std::atomic<float> clear_radius{0.15f};  // radius of the clear centre (0..1 of the view)
+    std::atomic<float> start_speed{20.0f};   // game-camera turn speed (deg/s) where it starts
+    std::atomic<float> full_speed{90.0f};    // ... and where it is at full strength
 };
 
 Hud& hud();

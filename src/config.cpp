@@ -54,13 +54,15 @@ void load() {
                  g_hud.width.load(), g_hud.distance.load(), g_hud.drop.load(), g_hud.follow_degrees.load());
     g_comfort.vignette = read(L"comfort", L"vignette", g_comfort.vignette ? 1.0f : 0.0f, 0.0f, 1.0f) >= 0.5f;
     g_comfort.strength = read(L"comfort", L"vignette_strength", g_comfort.strength, 0.0f, 1.0f);
+    g_comfort.clear_radius = read(L"comfort", L"vignette_clear_radius", g_comfort.clear_radius, 0.0f, 0.9f);
     g_comfort.start_speed = read(L"comfort", L"vignette_start_deg_per_s", g_comfort.start_speed, 0.0f, 720.0f);
     g_comfort.full_speed = read(L"comfort", L"vignette_full_deg_per_s", g_comfort.full_speed, 1.0f, 1440.0f);
     if (g_comfort.full_speed <= g_comfort.start_speed) {
         g_comfort.full_speed = g_comfort.start_speed + 1.0f;
     }
-    logger::info("[config] comfort vignette %s, strength %.2f, %.0f..%.0f deg/s", g_comfort.vignette ? "on" : "off",
-                 g_comfort.strength.load(), g_comfort.start_speed.load(), g_comfort.full_speed.load());
+    logger::info("[config] comfort vignette %s, strength %.2f, clear radius %.2f, %.0f..%.0f deg/s",
+                 g_comfort.vignette ? "on" : "off", g_comfort.strength.load(), g_comfort.clear_radius.load(),
+                 g_comfort.start_speed.load(), g_comfort.full_speed.load());
     save_hud(); // writes defaults for keys the file lacks, so they can be edited
     save_comfort();
 }
@@ -68,6 +70,7 @@ void load() {
 void save_comfort() {
     write(L"comfort", L"vignette", g_comfort.vignette ? 1.0f : 0.0f);
     write(L"comfort", L"vignette_strength", g_comfort.strength);
+    write(L"comfort", L"vignette_clear_radius", g_comfort.clear_radius);
     write(L"comfort", L"vignette_start_deg_per_s", g_comfort.start_speed);
     write(L"comfort", L"vignette_full_deg_per_s", g_comfort.full_speed);
 }

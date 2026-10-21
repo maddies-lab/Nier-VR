@@ -121,6 +121,7 @@ std::atomic<float> g_turn_rate{0.0f};
 XrSwapchain g_vignette_swapchain = XR_NULL_HANDLE;
 std::vector<ID3D11Texture2D*> g_vignette_images;
 int g_vignette_level = -1;
+float g_vignette_radius = -1.0f;
 XrPosef g_screen_pose{{0, 0, 0, 1}, {0, 0, -k_screen_distance}};
 
 // Written by the XR thread, read by game threads in begin_render_view.
@@ -668,7 +669,8 @@ bool update_vignette(int level) {
     if (g_vignette_swapchain == XR_NULL_HANDLE && !create_vignette_swapchain()) {
         return false;
     }
-    if (level == g_vignette_level) {
+    const float clear = config::comfort().clear_radius;
+    if (level == g_vignette_level && clear == g_vignette_radius) {
         return true;
     }
     uint32_t index = 0;
@@ -687,7 +689,8 @@ bool update_vignette(int level) {
                 const float u = (x + 0.5f) / k_vignette_size * 2.0f - 1.0f;
                 const float v = (y + 0.5f) / k_vignette_size * 2.0f - 1.0f;
                 const float r = std::sqrt(u * u + v * v);
-                float t = std::clamp((r - 0.30f) / (0.85f - 0.30f), 0.0f, 1.0f);
+                // The visible edge of a Quest-class view is at r ~0.7 of this quad.
+                float t = std::clamp((r - clear) / (0.72f - clear), 0.0f, 1.0f);
                 t = t * t * (3.0f - 2.0f * t);
                 const auto alpha = static_cast<uint32_t>(std::lround(t * strength * 255.0f));
                 pixels[y * k_vignette_size + x] = alpha << 24;
@@ -695,10 +698,11 @@ bool update_vignette(int level) {
         }
         g_xr_context->UpdateSubresource(g_vignette_images.at(index), 0, nullptr, pixels.data(), k_vignette_size * 4, 0);
         g_vignette_level = level;
+        g_vignette_radius = clear;
     }
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     fn::xrReleaseSwapchainImage(g_vignette_swapchain, &release);
-    return g_vignette_level == level;
+    return g_vignette_level == level && g_vignette_radius == clear;
 }
 
 // The HUD quad's pose for this headset frame: head position, lazily followed yaw.
@@ -1052,6 +1056,32 @@ void on_present(IDXGISwapChain* swapchain) {
         logger::info("[config] comfort vignette %s", config::comfort().vignette ? "on" : "off");
     }
     vignette_key_down = vignette_down;
+
+    // Numpad 7/9: vignette weaker/stronger; Numpad 1/3: clear centre smaller/bigger.
+    struct ComfortKey {
+        int key;
+        std::atomic<float>* value;
+        float step, low, high;
+    };
+    auto& comfort = config::comfort();
+    static const ComfortKey comfort_keys[] = {
+        {VK_NUMPAD7, &comfort.strength, -0.1f, 0.0f, 1.0f},
+        {VK_NUMPAD9, &comfort.strength, 0.1f, 0.0f, 1.0f},
+        {VK_NUMPAD1, &comfort.clear_radius, -0.05f, 0.0f, 0.6f},
+        {VK_NUMPAD3, &comfort.clear_radius, 0.05f, 0.0f, 0.6f},
+    };
+    static bool comfort_key_down[4]{};
+    for (int i = 0; i < 4; ++i) {
+        const bool down = (GetAsyncKeyState(comfort_keys[i].key) & 0x8000) != 0;
+        if (down && !comfort_key_down[i]) {
+            const auto& k = comfort_keys[i];
+            k.value->store(std::clamp(k.value->load() + k.step, k.low, k.high));
+            config::save_comfort();
+            logger::info("[config] comfort vignette strength %.2f, clear radius %.2f", comfort.strength.load(),
+                         comfort.clear_radius.load());
+        }
+        comfort_key_down[i] = down;
+    }
 
     const bool stereo_down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (stereo_down && !g_stereo_key_was_down) {

@@ -104,8 +104,9 @@ void draw_window(IDXGISwapChain* swapchain) {
                 vr.xr_copy.avg_ms, vr.xr_copy.max_ms, vr.xr_end.avg_ms, vr.xr_end.max_ms);
     ImGui::Text("  game    %5.1f fps  dropped %4.1f fps  copy %4.2f/%4.2f ms (avg/max)", vr.game_fps,
                 vr.dropped_fps, vr.game_copy.avg_ms, vr.game_copy.max_ms);
-    ImGui::Text("  game camera turn %.0f deg/s (comfort vignette %s)", vr.turn_rate,
-                config::comfort().vignette ? "on" : "off");
+    ImGui::Text("  game camera turn %.0f deg/s, comfort vignette %s (strength %.1f, clear %.2f; Num7/9, Num1/3)",
+                vr.turn_rate, config::comfort().vignette ? "on" : "off", config::comfort().strength.load(),
+                config::comfort().clear_radius.load());
     if (!vr.last_error.empty()) {
         ImGui::TextColored(ImVec4{1, 0.3f, 0.3f, 1}, "  %s", vr.last_error.c_str());
     }
