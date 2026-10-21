@@ -60,7 +60,7 @@ and the Khronos [OpenXR loader](https://github.com/KhronosGroup/OpenXR-SDK-Sourc
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE). Third-party code keeps its own license:
+GPL-3.0, see [LICENSE](LICENSE). Third-party code keeps its own license:
 MinHook (BSD-2-Clause), Dear ImGui (MIT), OpenXR loader (Apache-2.0); structure
 layouts adapted from AutomataMP (MIT, © praydog). NieR:Automata and its assets
 belong to Square Enix and are not part of this repository.
