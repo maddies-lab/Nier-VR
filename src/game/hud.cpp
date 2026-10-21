@@ -39,7 +39,8 @@ bool g_cleared = false;
 bool g_logged_first = false;
 std::vector<std::tuple<uintptr_t, UINT, UINT>> g_logged_kinds;
 std::vector<uintptr_t> g_sprite_ps;    // pixel shaders that have drawn HUD sprites
-UINT g_full_width = 0;                 // widest R11G11B10 target seen (the scene target)
+UINT g_full_width = 0;
+bool g_logged_overlay = false;                 // widest R11G11B10 target seen (the scene target)
 
 // State saved around a redirected draw.
 bool g_redirected = false;
@@ -323,6 +324,68 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     return !samples_screen;
 }
 
+// Untextured alpha-blended full-screen quads into the scene target: the sprint
+// vignette (found with the effect hunt: no texture at t0/t1, SRC_ALPHA /
+// INV_SRC_ALPHA). Head-locked in VR, so removed while head-tracked.
+bool is_screen_overlay(ID3D11DeviceContext* context, UINT count) {
+    if (count > 6) {
+        return false;
+    }
+    ID3D11ShaderResourceView* srvs[2]{};
+    context->PSGetShaderResources(0, 2, srvs);
+    const bool untextured = srvs[0] == nullptr && srvs[1] == nullptr;
+    for (auto srv : srvs) {
+        if (srv != nullptr) {
+            srv->Release();
+        }
+    }
+    if (!untextured) {
+        return false;
+    }
+
+    ID3D11BlendState* blend = nullptr;
+    float factor[4];
+    UINT mask = 0;
+    context->OMGetBlendState(&blend, factor, &mask);
+    bool alpha_blend = false;
+    if (blend != nullptr) {
+        D3D11_BLEND_DESC desc{};
+        blend->GetDesc(&desc);
+        const auto& rt = desc.RenderTarget[0];
+        alpha_blend = rt.BlendEnable && rt.SrcBlend == D3D11_BLEND_SRC_ALPHA && rt.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+        blend->Release();
+    }
+    if (!alpha_blend) {
+        return false;
+    }
+
+    ID3D11RenderTargetView* rtv = nullptr;
+    context->OMGetRenderTargets(1, &rtv, nullptr);
+    if (rtv == nullptr) {
+        return false;
+    }
+    ID3D11Resource* resource = nullptr;
+    rtv->GetResource(&resource);
+    rtv->Release();
+    bool scene_target = false;
+    if (resource != nullptr) {
+        D3D11_RESOURCE_DIMENSION dimension{};
+        resource->GetType(&dimension);
+        if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+            D3D11_TEXTURE2D_DESC desc{};
+            static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+            scene_target = desc.Format == DXGI_FORMAT_R11G11B10_FLOAT && desc.Width >= k_min_target_width &&
+                           desc.Width >= g_full_width;
+        }
+        resource->Release();
+    }
+    if (scene_target && !g_logged_overlay) {
+        g_logged_overlay = true;
+        logger::info("[hud] untextured full-screen overlay (sprint vignette) removed while head-tracked");
+    }
+    return scene_target;
+}
+
 bool before_draw(ID3D11DeviceContext* context, UINT count) {
     if (effect_hunt::should_skip(context, count)) {
         return true;
@@ -330,6 +393,9 @@ bool before_draw(ID3D11DeviceContext* context, UINT count) {
     const Mode mode = g_mode;
     if (mode == Mode::off) {
         return false;
+    }
+    if (is_screen_overlay(context, count)) {
+        return true;
     }
     D3D11_TEXTURE2D_DESC target{};
     const bool ui = is_ui_draw(context, target);
