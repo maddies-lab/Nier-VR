@@ -278,9 +278,9 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     }
     samples_screen = samples_screen && !sprite_shader;
 
-    // Full-screen quads that blend over the image are screen effects (sprint speed
-    // lines / radial blur, vignettes): head-locked in VR, so they are removed. The
-    // scene composite is an opaque copy and stays.
+    // Full-screen quads that blend over the image are screen effects (low-health
+    // greyscale, hit glitches): kept in each eye's scene, not on the HUD panel. The
+    // scene composite is an opaque copy and stays too.
     if (samples_screen) {
         ID3D11BlendState* blend = nullptr;
         float factor[4];
@@ -298,7 +298,7 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
             if (std::find(g_logged_effects.begin(), g_logged_effects.end(), ps_key) == g_logged_effects.end() &&
                 g_logged_effects.size() < 32) {
                 g_logged_effects.push_back(ps_key);
-                logger::info("[hud] full-screen effect (ps %llx) removed while head-tracked", (unsigned long long)ps_key);
+                logger::info("[hud] full-screen UI-phase effect (ps %llx) kept in the scene", (unsigned long long)ps_key);
             }
         }
     } else {
@@ -396,7 +396,7 @@ bool before_draw(ID3D11DeviceContext* context, UINT count) {
     D3D11_TEXTURE2D_DESC target{};
     const bool ui = is_ui_draw(context, target);
     if (g_last_kind == Kind::screen_effect) {
-        return true; // skipped in every head-tracked pass
+        return false; // drawn into the scene of each eye (e.g. low-health greyscale)
     }
     if (!ui) {
         return false;
