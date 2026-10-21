@@ -52,6 +52,7 @@ add_library(nier_vr SHARED
     src/game/census.cpp
     src/game/stereo_render.cpp
     src/game/dump.cpp
+    src/game/effect_hunt.cpp
     src/game/hud.cpp
     src/game/inspect.cpp
     src/game/player.cpp

@@ -10,6 +10,7 @@
 
 #include <windows.h>
 
+#include "game/effect_hunt.hpp"
 #include "hooks/context_hook.hpp"
 #include "log.hpp"
 
@@ -322,7 +323,10 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     return !samples_screen;
 }
 
-bool before_draw(ID3D11DeviceContext* context) {
+bool before_draw(ID3D11DeviceContext* context, UINT count) {
+    if (effect_hunt::should_skip(context, count)) {
+        return true;
+    }
     const Mode mode = g_mode;
     if (mode == Mode::off) {
         return false;
@@ -432,6 +436,7 @@ bool captured_any() {
 }
 
 void on_present() {
+    effect_hunt::on_present();
     const bool down = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
     if (down && !g_key_was_down) {
         g_enabled = !g_enabled;

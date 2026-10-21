@@ -42,10 +42,11 @@ void unmap_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT
 void update_original(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT subresource, const D3D11_BOX* box,
                      const void* data, UINT row_pitch, UINT depth_pitch);
 
-// One module may intercept draws: `before` runs before every draw call and returns
-// true to skip it; `after` runs after draws that were not skipped.
+// One module may intercept draws: `before` runs before every draw call (with its
+// vertex or index count per instance) and returns true to skip it; `after` runs
+// after draws that were not skipped.
 struct DrawInterceptor {
-    bool (*before)(ID3D11DeviceContext* context) = nullptr;
+    bool (*before)(ID3D11DeviceContext* context, UINT count) = nullptr;
     void (*after)(ID3D11DeviceContext* context) = nullptr;
 };
 void set_draw_interceptor(const DrawInterceptor& interceptor);

@@ -40,7 +40,7 @@ struct InterceptScope {
     ID3D11DeviceContext* context;
     bool active;
     explicit InterceptScope(ID3D11DeviceContext* c) : context(c), active(g_intercepting) {}
-    bool skip() { return active && g_interceptor.before(context); }
+    bool skip(UINT count) { return active && g_interceptor.before(context, count); }
     ~InterceptScope() {
         if (active && !skipped && g_interceptor.after) {
             g_interceptor.after(context);
@@ -96,7 +96,7 @@ void STDMETHODCALLTYPE dii(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e
     ++g_counters[count_draw];
     notify_draw_detail(c, 2, a, b, d, static_cast<UINT>(e), f);
     InterceptScope scope{c};
-    if (scope.skip()) {
+    if (scope.skip(a)) {
         scope.skipped = true;
         return;
     }
@@ -106,7 +106,7 @@ void STDMETHODCALLTYPE di(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e
     ++g_counters[count_draw];
     notify_draw_detail(c, 3, a, b, d, e, 0);
     InterceptScope scope{c};
-    if (scope.skip()) {
+    if (scope.skip(a)) {
         scope.skipped = true;
         return;
     }
@@ -196,7 +196,7 @@ void STDMETHODCALLTYPE draw_indexed(ID3D11DeviceContext* self, UINT count, UINT 
     ++g_counters[count_draw];
     notify_draw_detail(self, 0, count, start, static_cast<UINT>(base), 0, 0);
     InterceptScope scope{self};
-    if (scope.skip()) {
+    if (scope.skip(count)) {
         scope.skipped = true;
         return;
     }
@@ -208,7 +208,7 @@ void STDMETHODCALLTYPE draw(ID3D11DeviceContext* self, UINT count, UINT start) {
     ++g_counters[count_draw];
     notify_draw_detail(self, 1, count, start, 0, 0, 0);
     InterceptScope scope{self};
-    if (scope.skip()) {
+    if (scope.skip(count)) {
         scope.skipped = true;
         return;
     }
