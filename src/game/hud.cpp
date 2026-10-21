@@ -325,21 +325,17 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
 }
 
 // Untextured alpha-blended full-screen quads into the scene target: the sprint
-// vignette (found with the effect hunt: no texture at t0/t1, SRC_ALPHA /
-// INV_SRC_ALPHA). Head-locked in VR, so removed while head-tracked.
+// vignette and the location-dependent ones (found with the effect hunt: nothing
+// at t0 - t1 may hold a stale binding - SRC_ALPHA / INV_SRC_ALPHA). Every textured
+// effect samples t0. Head-locked in VR, so removed while head-tracked.
 bool is_screen_overlay(ID3D11DeviceContext* context, UINT count) {
     if (count > 6) {
         return false;
     }
-    ID3D11ShaderResourceView* srvs[2]{};
-    context->PSGetShaderResources(0, 2, srvs);
-    const bool untextured = srvs[0] == nullptr && srvs[1] == nullptr;
-    for (auto srv : srvs) {
-        if (srv != nullptr) {
-            srv->Release();
-        }
-    }
-    if (!untextured) {
+    ID3D11ShaderResourceView* t0 = nullptr;
+    context->PSGetShaderResources(0, 1, &t0);
+    if (t0 != nullptr) {
+        t0->Release();
         return false;
     }
 
