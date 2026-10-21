@@ -238,6 +238,25 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     // Full-screen quads through the UI camera sample a texture of the target's size.
     ID3D11ShaderResourceView* srvs[8]{};
     context->PSGetShaderResources(0, 8, srvs);
+    // Effect-system draws (screen effects such as the low-health shadow) bind a
+    // 32x32 BC1 noise texture at t3; HUD sprites don't.
+    bool effect_system = false;
+    if (srvs[3] != nullptr) {
+        ID3D11Resource* noise = nullptr;
+        srvs[3]->GetResource(&noise);
+        if (noise != nullptr) {
+            D3D11_RESOURCE_DIMENSION dimension{};
+            noise->GetType(&dimension);
+            if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+                D3D11_TEXTURE2D_DESC desc{};
+                static_cast<ID3D11Texture2D*>(noise)->GetDesc(&desc);
+                effect_system = desc.Width == 32 && desc.Height == 32 &&
+                                (desc.Format == DXGI_FORMAT_BC1_UNORM || desc.Format == DXGI_FORMAT_BC1_TYPELESS ||
+                                 desc.Format == DXGI_FORMAT_BC1_UNORM_SRGB);
+            }
+            noise->Release();
+        }
+    }
     bool samples_screen = false;
     UINT largest_w = 0, largest_h = 0;
     for (auto srv : srvs) {
@@ -268,6 +287,16 @@ bool is_ui_draw(ID3D11DeviceContext* context, D3D11_TEXTURE2D_DESC& target) {
     if (ps_now != nullptr) {
         ps_now->Release();
     }
+    if (effect_system) {
+        if (std::find(g_logged_effects.begin(), g_logged_effects.end(), ps_key) == g_logged_effects.end() &&
+            g_logged_effects.size() < 32) {
+            g_logged_effects.push_back(ps_key);
+            logger::info("[hud] UI-camera effect-system draw (ps %llx) kept in the scene", (unsigned long long)ps_key);
+        }
+        g_last_kind = Kind::screen_effect;
+        return false;
+    }
+
     // A shader that draws small textures (atlases, fonts) is a HUD sprite shader;
     // full-screen-texture draws are HUD only with such a shader (the minimap's land
     // layout). The scene composite, transition fades (a capture of the previous
